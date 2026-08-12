@@ -859,6 +859,9 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
                   </Badge>
                 )}
               </div>
+              <p className="text-xs text-muted-foreground">
+                {t("settings.authorCredit")}
+              </p>
             </div>
           </div>
 

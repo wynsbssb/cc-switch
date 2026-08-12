@@ -793,6 +793,7 @@
     "checking": "檢查中...",
     "upToDate": "已是最新",
     "aboutHint": "檢視版本資訊與更新狀態。",
+    "authorCredit": "???tycykp",
     "portableMode": "目前為可攜版，更新需手動下載。",
     "updateAvailable": "檢測到新版本：{{version}}",
     "updateBadge": "有更新可用",
