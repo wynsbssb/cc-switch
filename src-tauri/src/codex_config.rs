@@ -647,6 +647,7 @@ fn codex_catalog_model_entry(
 
     let display_name = spec.display_name.as_deref().unwrap_or(&spec.model);
     let context_window = spec.context_window.unwrap_or(default_context_window);
+    entry_obj.insert("model".to_string(), json!(spec.model));
     entry_obj.insert("slug".to_string(), json!(spec.model));
     entry_obj.insert("display_name".to_string(), json!(display_name));
     entry_obj.insert("description".to_string(), json!(display_name));
@@ -2063,6 +2064,7 @@ fn codex_vendor_catalog_model_entry(
 
     if matched.is_none() || preserve_public_identity {
         let display_name = spec.display_name.as_deref().unwrap_or(&spec.model);
+        entry_obj.insert("model".to_string(), json!(spec.model));
         entry_obj.insert("slug".to_string(), json!(spec.model));
         entry_obj.insert("display_name".to_string(), json!(display_name));
         entry_obj.insert("description".to_string(), json!(display_name));
