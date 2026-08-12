@@ -18,6 +18,8 @@ import {
 } from "@/components/ui/collapsible";
 import { toast } from "sonner";
 import {
+  ArrowDown,
+  ArrowUp,
   ChevronDown,
   ChevronRight,
   Download,
@@ -26,9 +28,15 @@ import {
   Trash2,
 } from "lucide-react";
 import EndpointSpeedTest from "./EndpointSpeedTest";
-import { ApiKeySection, EndpointField, ModelDropdown } from "./shared";
+import {
+  ApiKeySection,
+  EndpointField,
+  ModelDropdown,
+  ModelInputWithFetch,
+} from "./shared";
 import { XaiOAuthSection } from "./XaiOAuthSection";
 import {
+  fetchCodexOfficialModels,
   fetchModelsForConfig,
   fetchXaiOauthModels,
   showFetchModelsError,
@@ -37,13 +45,18 @@ import {
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { cn } from "@/lib/utils";
+import { extractCodexModelName } from "@/utils/providerConfigUtils";
+import { CODEX_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
 import type {
   ClaudeApiKeyField,
   CodexApiFormat,
   CodexCatalogModel,
   CodexChatReasoning,
+  CodexCustomModel,
+  CodexCustomModelRoute,
   PromptCacheRoutingMode,
   ProviderCategory,
+  Provider,
 } from "@/types";
 import type { AppId } from "@/lib/api";
 
@@ -106,6 +119,19 @@ interface CodexFormFieldsProps {
   catalogModels?: CodexCatalogModel[];
   onCatalogModelsChange?: (models: CodexCatalogModel[]) => void;
 
+  // 官方 Codex 供应商的自定义模型（对外 ID -> 绑定供应商）
+  codexCustomModels?: CodexCustomModel[];
+  onCodexCustomModelsChange?: (models: CodexCustomModel[]) => void;
+  // 可绑定的 Codex 供应商列表（下拉选择目标供应商）
+  codexProviders?: Provider[];
+  // 官方 Codex：是否启用官方登录（关闭 = 聚合模式，多供应商模型切换）
+  enableOfficialLogin?: boolean;
+  onEnableOfficialLoginChange?: (value: boolean) => void;
+  // 官方 Codex：模型聚合总开关。关闭时隐藏登录选择与自定义模型配置，
+  // 官方供应商按普通官方登录处理。
+  codexAggregationEnabled?: boolean;
+  onCodexAggregationEnabledChange?: (value: boolean) => void;
+
   // Speed Test Endpoints
   speedTestEndpoints: EndpointCandidate[];
 
@@ -163,6 +189,117 @@ function catalogRowsMatchModels(
   });
 }
 
+type CodexCustomModelRouteRow = CodexCustomModelRoute & { routeId: string };
+
+type CodexCustomModelRow = Omit<
+  CodexCustomModel,
+  "providerId" | "upstreamModel" | "routes"
+> & {
+  rowId: string;
+  routes: CodexCustomModelRouteRow[];
+};
+
+// Codex ???????????gpt-5.x ???????????????
+// ??????????????????????????????
+// ?????????????????????????????????
+const CODEX_OFFICIAL_MODEL_NAMES = [
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.5",
+  "gpt-5.4-mini",
+  "gpt-5.2",
+  "codex-auto-review",
+] as const;
+
+/// ??????????????????? model ???
+const CODEX_SLOT_CLEAR_VALUE = "__codex_slot_clear__";
+
+function createCustomModelRouteRow(
+  seed?: Partial<CodexCustomModelRoute>,
+): CodexCustomModelRouteRow {
+  return {
+    routeId: crypto.randomUUID(),
+    providerId: seed?.providerId ?? "",
+    upstreamModel: seed?.upstreamModel ?? "",
+  };
+}
+
+function customModelRoutesFromSeed(
+  seed?: Partial<CodexCustomModel>,
+): CodexCustomModelRouteRow[] {
+  const seedRoutes =
+    seed?.routes && seed.routes.length > 0
+      ? seed.routes
+      : seed?.providerId
+        ? [{ providerId: seed.providerId, upstreamModel: seed.upstreamModel }]
+        : [];
+  if (seedRoutes.length === 0) return [createCustomModelRouteRow()];
+  return seedRoutes.map((route) => createCustomModelRouteRow(route));
+}
+
+function createCustomModelRow(
+  seed?: Partial<CodexCustomModel>,
+): CodexCustomModelRow {
+  return {
+    rowId: crypto.randomUUID(),
+    model: seed?.model ?? "",
+    displayName: seed?.displayName ?? "",
+    contextWindow: seed?.contextWindow ?? "",
+    ...(seed?.supportsParallelToolCalls !== undefined
+      ? { supportsParallelToolCalls: seed.supportsParallelToolCalls }
+      : {}),
+    ...(seed?.inputModalities ? { inputModalities: seed.inputModalities } : {}),
+    ...(seed?.baseInstructions
+      ? { baseInstructions: seed.baseInstructions }
+      : {}),
+    routes: customModelRoutesFromSeed(seed),
+  };
+}
+
+export function applyCodexCustomModelCatalogSelection<
+  T extends CodexCustomModel,
+>(row: T, upstreamModel: string, match?: CodexCatalogModel): T {
+  return {
+    ...row,
+    upstreamModel,
+    displayName: match?.displayName?.trim() || "",
+    contextWindow: match?.contextWindow ?? "",
+    supportsParallelToolCalls: match?.supportsParallelToolCalls,
+    inputModalities: match?.inputModalities
+      ? [...match.inputModalities]
+      : undefined,
+    baseInstructions: match?.baseInstructions,
+  };
+}
+
+export function customRowsMatchModels(
+  rows: CodexCustomModel[],
+  models: CodexCustomModel[],
+): boolean {
+  if (rows.length !== models.length) return false;
+  return rows.every((row, i) => {
+    const incoming = models[i];
+    const rowRoutes = (row.routes ?? []).map(
+      (route) => `${route.providerId}\u0000${route.upstreamModel ?? ""}`,
+    );
+    const incomingRoutes = (incoming.routes ?? []).map(
+      (route) => `${route.providerId}\u0000${route.upstreamModel ?? ""}`,
+    );
+    return (
+      row.model === (incoming.model ?? "") &&
+      (row.displayName ?? "") === (incoming.displayName ?? "") &&
+      String(row.contextWindow ?? "") ===
+        String(incoming.contextWindow ?? "") &&
+      (row.supportsParallelToolCalls ?? null) ===
+        (incoming.supportsParallelToolCalls ?? null) &&
+      (row.baseInstructions ?? "") === (incoming.baseInstructions ?? "") &&
+      JSON.stringify(row.inputModalities ?? []) ===
+        JSON.stringify(incoming.inputModalities ?? []) &&
+      JSON.stringify(rowRoutes) === JSON.stringify(incomingRoutes)
+    );
+  });
+}
+
 export function CodexFormFields({
   appId = "codex",
   providerId,
@@ -203,6 +340,13 @@ export function CodexFormFields({
   onPromptCacheRoutingChange,
   catalogModels = [],
   onCatalogModelsChange,
+  codexCustomModels = [],
+  onCodexCustomModelsChange,
+  codexProviders = [],
+  enableOfficialLogin = true,
+  onEnableOfficialLoginChange,
+  codexAggregationEnabled = true,
+  onCodexAggregationEnabledChange,
   speedTestEndpoints,
   customUserAgent,
   onCustomUserAgentChange,
@@ -273,6 +417,28 @@ export function CodexFormFields({
     }
   }, [hasAnyAdvancedValue, isXaiOauthPreset]);
 
+  // 官方 Codex 自定义模型的插槽下拉：优先从官方动态获取当前模型，失败（未登录/
+  // 请求异常）时回退到内置快照列表，避免绑定已下线的插槽导致模型在 Codex 里不显示。
+  const [officialModelSlugs, setOfficialModelSlugs] = useState<string[]>([]);
+  useEffect(() => {
+    if (category !== "official") {
+      return;
+    }
+    let cancelled = false;
+    fetchCodexOfficialModels()
+      .then((slugs) => {
+        if (!cancelled && slugs.length > 0) {
+          setOfficialModelSlugs(slugs);
+        }
+      })
+      .catch(() => {
+        // 保持空数组，回退到 CODEX_OFFICIAL_MODEL_NAMES
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [category]);
+
   const [catalogRows, setCatalogRows] = useState<CodexCatalogRow[]>(() =>
     catalogModels.map((m) => createCatalogRow(m)),
   );
@@ -303,6 +469,197 @@ export function CodexFormFields({
     lastSentModelsRef.current = next;
     onCatalogModelsChange(next);
   }, [catalogRows, onCatalogModelsChange]);
+
+  // ---- 官方 Codex 自定义模型行（对外 ID -> 绑定供应商） ----
+  const [customRows, setCustomRows] = useState<CodexCustomModelRow[]>(() =>
+    codexCustomModels.map((m) => createCustomModelRow(m)),
+  );
+
+  const lastSentCustomModelsRef = useRef<CodexCustomModel[]>(codexCustomModels);
+
+  useEffect(() => {
+    setCustomRows((current) => {
+      if (customRowsMatchModels(current, codexCustomModels)) return current;
+      return codexCustomModels.map((m) => createCustomModelRow(m));
+    });
+    lastSentCustomModelsRef.current = codexCustomModels;
+  }, [codexCustomModels]);
+
+  useEffect(() => {
+    if (!onCodexCustomModelsChange) return;
+    const next: CodexCustomModel[] = customRows.map(
+      ({ rowId: _rowId, routes, ...rest }) => ({
+        ...rest,
+        routes: routes.map(({ routeId: _routeId, ...route }) => route),
+      }),
+    );
+    if (customRowsMatchModels(customRows, lastSentCustomModelsRef.current))
+      return;
+    lastSentCustomModelsRef.current = next;
+    onCodexCustomModelsChange(next);
+  }, [customRows, onCodexCustomModelsChange]);
+
+  const handleAddCustomModelRow = useCallback(() => {
+    if (!onCodexCustomModelsChange) return;
+    setCustomRows((current) => [...current, createCustomModelRow()]);
+  }, [onCodexCustomModelsChange]);
+
+  const handleRemoveCustomModelRow = useCallback((index: number) => {
+    setCustomRows((current) => current.filter((_, i) => i !== index));
+  }, []);
+
+  const handleAddCustomModelRoute = useCallback((index: number) => {
+    setCustomRows((current) =>
+      current.map((row, i) =>
+        i === index
+          ? { ...row, routes: [...row.routes, createCustomModelRouteRow()] }
+          : row,
+      ),
+    );
+  }, []);
+
+  const handleRemoveCustomModelRoute = useCallback(
+    (index: number, routeIndex: number) => {
+      setCustomRows((current) =>
+        current.map((row, i) =>
+          i === index
+            ? {
+                ...row,
+                routes: row.routes.filter((_, ri) => ri !== routeIndex),
+              }
+            : row,
+        ),
+      );
+    },
+    [],
+  );
+
+  const handleMoveCustomModelRoute = useCallback(
+    (index: number, routeIndex: number, direction: -1 | 1) => {
+      setCustomRows((current) =>
+        current.map((row, i) => {
+          if (i !== index) return row;
+          const nextIndex = routeIndex + direction;
+          if (nextIndex < 0 || nextIndex >= row.routes.length) return row;
+          const routes = [...row.routes];
+          const [moved] = routes.splice(routeIndex, 1);
+          routes.splice(nextIndex, 0, moved);
+          return { ...row, routes };
+        }),
+      );
+    },
+    [],
+  );
+
+  // ---- 自定义模型：从目标供应商的模型目录自动带出模型/上下文 ----
+  const providerCatalogModels = useCallback(
+    (providerId: string): CodexCatalogModel[] => {
+      const provider = codexProviders.find((p) => p.id === providerId);
+      const catalog = (provider?.settingsConfig as any)?.modelCatalog?.models;
+      return Array.isArray(catalog)
+        ? catalog.filter(
+            (m: CodexCatalogModel) =>
+              typeof m.model === "string" && m.model.trim(),
+          )
+        : [];
+    },
+    [codexProviders],
+  );
+
+  // 实际请求模型下拉选项：供应商已配置的模型目录（与目标供应商列同款 Select）
+  const customCatalogByProvider = useMemo(() => {
+    const map: Record<string, CodexCatalogModel[]> = {};
+    for (const provider of codexProviders) {
+      const models = providerCatalogModels(provider.id);
+      if (models.length === 0) continue;
+      map[provider.id] = models;
+    }
+    return map;
+  }, [codexProviders, providerCatalogModels]);
+
+  // 选定供应商后：带出默认上游模型，并尽量自动填显示名/上下文窗口。
+  // 模型名称（Codex 展示用）保持用户选择不变。
+  const handleCustomRouteProviderChange = useCallback(
+    (index: number, routeIndex: number, providerId: string) => {
+      const provider = codexProviders.find((p) => p.id === providerId);
+      const models = providerCatalogModels(providerId);
+      const defaultUpstreamModel =
+        extractCodexModelName(
+          typeof provider?.settingsConfig?.config === "string"
+            ? provider.settingsConfig.config
+            : "",
+        ) ||
+        models[0]?.model ||
+        "";
+      const match = models.find((m) => m.model === defaultUpstreamModel);
+      setCustomRows((current) =>
+        current.map((row, i) => {
+          if (i !== index) return row;
+          const routes = row.routes.map((route, ri) =>
+            ri === routeIndex
+              ? { ...route, providerId, upstreamModel: defaultUpstreamModel }
+              : route,
+          );
+          if (routeIndex !== 0) return { ...row, routes };
+          return {
+            ...row,
+            routes,
+            displayName: match?.displayName?.trim() || "",
+            contextWindow: match?.contextWindow ?? "",
+            supportsParallelToolCalls: match?.supportsParallelToolCalls,
+            inputModalities: match?.inputModalities
+              ? [...match.inputModalities]
+              : undefined,
+            baseInstructions: match?.baseInstructions,
+          };
+        }),
+      );
+    },
+    [codexProviders, providerCatalogModels],
+  );
+
+  const handleCustomRouteModelChange = useCallback(
+    (index: number, routeIndex: number, model: string) => {
+      setCustomRows((current) =>
+        current.map((row, i) => {
+          if (i !== index) return row;
+          const providerId =
+            routeIndex === 0
+              ? row.routes[0]?.providerId
+              : row.routes[routeIndex]?.providerId;
+          const match = providerCatalogModels(providerId ?? "").find(
+            (m) => m.model === model,
+          );
+          const routes = row.routes.map((route, ri) =>
+            ri === routeIndex ? { ...route, upstreamModel: model } : route,
+          );
+          if (routeIndex !== 0) return { ...row, routes };
+          return {
+            ...row,
+            routes,
+            displayName: match?.displayName?.trim() || "",
+            contextWindow: match?.contextWindow ?? "",
+            supportsParallelToolCalls: match?.supportsParallelToolCalls,
+            inputModalities: match?.inputModalities
+              ? [...match.inputModalities]
+              : undefined,
+            baseInstructions: match?.baseInstructions,
+          };
+        }),
+      );
+    },
+    [providerCatalogModels],
+  );
+
+  // ?????Codex ??????????? ID????????
+  const handleCustomDisplayModelChange = useCallback(
+    (index: number, model: string) => {
+      setCustomRows((current) =>
+        current.map((r, i) => (i === index ? { ...r, model } : r)),
+      );
+    },
+    [],
+  );
 
   const handleReasoningThinkingChange = useCallback(
     (checked: boolean) => {
@@ -611,6 +968,442 @@ export function CodexFormFields({
                 })}
               </Button>
             </p>
+          )}
+        </div>
+      )}
+
+      {/* 官方 Codex 自定义模型：把额外模型路由到 cc-switch 绑定的供应商 */}
+      {category === "official" && onCodexCustomModelsChange && (
+        <div className="space-y-4">
+          {/* 模型聚合总开关：关闭时隐藏登录选择与自定义模型配置 */}
+          <div className="flex items-center justify-between gap-4">
+            <div className="space-y-1">
+              <FormLabel>
+                {t("codexConfig.aggregationLabel", {
+                  defaultValue: "模型聚合",
+                })}
+              </FormLabel>
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                {t("codexConfig.aggregationHint", {
+                  defaultValue:
+                    "开启后可将其他供应商的模型聚合进 Codex（需先开启本地路由/代理才生效）。关闭时按普通官方模型登录处理。",
+                })}
+              </p>
+            </div>
+            <Switch
+              checked={codexAggregationEnabled}
+              onCheckedChange={(value) =>
+                onCodexAggregationEnabledChange?.(value)
+              }
+              aria-label={t("codexConfig.aggregationLabel", {
+                defaultValue: "模型聚合",
+              })}
+            />
+          </div>
+
+          {codexAggregationEnabled && (
+            <>
+              <div className="flex items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <FormLabel>
+                    {t("codexConfig.enableOfficialLoginLabel", {
+                      defaultValue: "启用官方登录",
+                    })}
+                  </FormLabel>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    {enableOfficialLogin
+                      ? t("codexConfig.enableOfficialLoginHintOn", {
+                          defaultValue:
+                            "使用 ChatGPT 账号登录官方模型；下方自定义模型仍走各自供应商的凭据。",
+                        })
+                      : t("codexConfig.enableOfficialLoginHintOff", {
+                          defaultValue:
+                            "无需登录：Codex 的模型全部来自下方配置的多个供应商，请求按模型路由到对应供应商。",
+                        })}
+                  </p>
+                </div>
+                <Switch
+                  checked={enableOfficialLogin}
+                  onCheckedChange={(value) =>
+                    onEnableOfficialLoginChange?.(value)
+                  }
+                  aria-label={t("codexConfig.enableOfficialLoginLabel", {
+                    defaultValue: "启用官方登录",
+                  })}
+                />
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-3">
+                  <FormLabel>
+                    {t("codexConfig.customModelsTitle", {
+                      defaultValue: "自定义模型（官方登录）",
+                    })}
+                  </FormLabel>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleAddCustomModelRow}
+                    className="h-7 gap-1"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    {t("codexConfig.addCustomModel", {
+                      defaultValue: "添加自定义模型",
+                    })}
+                  </Button>
+                </div>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  {enableOfficialLogin
+                    ? t("codexConfig.customModelsHint", {
+                        defaultValue:
+                          "配置后 Codex 会在模型列表里看到这些模型；选择它们时，本地代理会把请求转发到你绑定的供应商（保留官方登录，仅支持 OpenAI Responses 协议）。",
+                      })
+                    : t("codexConfig.customModelsHintAggregate", {
+                        defaultValue:
+                          "Codex 桌面端只认官方模型名：为每个模型选一个 Codex 插槽名（如 gpt-5.2），实际请求会映射到你绑定的供应商的上游模型。",
+                      })}
+                </p>
+              </div>
+
+              {customRows.length > 0 && (
+                <div className="space-y-2">
+                  <div className="hidden grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_110px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+                    <span>
+                      {t("codexConfig.customColumnProvider", {
+                        defaultValue: "目标供应商",
+                      })}
+                    </span>
+                    <span>
+                      {t("codexConfig.customColumnModelName", {
+                        defaultValue: "Codex 插槽",
+                      })}
+                    </span>
+                    <span>
+                      {t("codexConfig.catalogColumnDisplay", {
+                        defaultValue: "菜单显示名",
+                      })}
+                    </span>
+                    <span>
+                      {t("codexConfig.catalogColumnModel", {
+                        defaultValue: "实际请求模型",
+                      })}
+                    </span>
+                    <span>
+                      {t("codexConfig.catalogColumnContext", {
+                        defaultValue: "上下文窗口",
+                      })}
+                    </span>
+                    <span />
+                  </div>
+
+                  {customRows.map((row, index) => {
+                    return (
+                      <div
+                        key={row.rowId}
+                        className="space-y-2 rounded-lg border border-border-default p-3"
+                      >
+                        {/* ???? + ?????? + ?? */}
+                        <div className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_36px]">
+                          <Select
+                            value={row.model}
+                            onValueChange={(value) =>
+                              handleCustomDisplayModelChange(
+                                index,
+                                value === CODEX_SLOT_CLEAR_VALUE ? "" : value,
+                              )
+                            }
+                          >
+                            <SelectTrigger
+                              className="min-w-0 select-fade-value"
+                              aria-label={t(
+                                "codexConfig.customColumnModelName",
+                                {
+                                  defaultValue: "Codex ??",
+                                },
+                              )}
+                              title={t("codexConfig.customModelNameHint", {
+                                defaultValue:
+                                  "Codex ?????????????? Codex ????? gpt-5.2????????????????????????????",
+                              })}
+                            >
+                              <SelectValue
+                                placeholder={t(
+                                  "codexConfig.customModelNamePlaceholder",
+                                  {
+                                    defaultValue: "??? Codex ???? gpt-5.2?",
+                                  },
+                                )}
+                              />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value={CODEX_SLOT_CLEAR_VALUE}>
+                                {t("codexConfig.customSlotClear", {
+                                  defaultValue: "????",
+                                })}
+                              </SelectItem>
+                              {(() => {
+                                const slotBase =
+                                  officialModelSlugs.length > 0
+                                    ? officialModelSlugs
+                                    : CODEX_OFFICIAL_MODEL_NAMES;
+                                const usedElsewhere = new Set(
+                                  customRows
+                                    .filter((_r, i2) => i2 !== index)
+                                    .map((r) => r.model)
+                                    .filter(Boolean),
+                                );
+                                const slotOptions: string[] = slotBase.filter(
+                                  (m) => !usedElsewhere.has(m),
+                                );
+                                if (
+                                  row.model &&
+                                  !slotOptions.includes(row.model)
+                                ) {
+                                  slotOptions.push(row.model);
+                                }
+                                return slotOptions;
+                              })().map((model) => (
+                                <SelectItem key={model} value={model}>
+                                  {model}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <div
+                            className="flex h-9 min-w-0 items-center rounded-md border border-transparent px-3 text-sm text-muted-foreground"
+                            aria-label={t("codexConfig.catalogColumnDisplay", {
+                              defaultValue: "?????",
+                            })}
+                            title={t(
+                              "codexConfig.customDisplayNameReadonlyHint",
+                              {
+                                defaultValue: "??????????????????",
+                              },
+                            )}
+                          >
+                            <span className="flex-1 text-fade-out">
+                              {row.displayName?.trim() || row.model || "?"}
+                            </span>
+                          </div>
+                          <div
+                            className="flex h-9 min-w-0 items-center rounded-md border border-transparent px-3 text-sm text-muted-foreground"
+                            aria-label={t("codexConfig.catalogColumnContext", {
+                              defaultValue: "?????",
+                            })}
+                            title={t("codexConfig.customContextReadonlyHint", {
+                              defaultValue: "????????????????????????",
+                            })}
+                          >
+                            <span className="flex-1 text-fade-out">
+                              {row.contextWindow
+                                ? `${row.contextWindow}`
+                                : t("codexConfig.catalogContextPlaceholder", {
+                                    defaultValue: "?? 128k",
+                                  })}
+                            </span>
+                          </div>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => handleRemoveCustomModelRow(index)}
+                            className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                            aria-label={t("codexConfig.removeCustomModel", {
+                              defaultValue: "??",
+                            })}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+
+                        {/* ?????????????????????? */}
+                        <div className="space-y-2 pt-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-medium text-muted-foreground">
+                              {t("codexConfig.customRouteChainTitle", {
+                                defaultValue: "???????????",
+                              })}
+                            </span>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => handleAddCustomModelRoute(index)}
+                            >
+                              <Plus className="h-4 w-4" />
+                              {t("codexConfig.addCustomRoute", {
+                                defaultValue: "????",
+                              })}
+                            </Button>
+                          </div>
+                          {row.routes.map((route, routeIndex) => (
+                            <div
+                              key={route.routeId}
+                              className="grid grid-cols-1 items-center gap-2 md:grid-cols-[44px_minmax(0,1.2fr)_minmax(0,1fr)_92px_36px_36px]"
+                            >
+                              <div
+                                className="flex h-9 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground"
+                                aria-label={t(
+                                  "codexConfig.customRoutePriority",
+                                  {
+                                    defaultValue: "???",
+                                  },
+                                )}
+                              >
+                                {routeIndex + 1}
+                              </div>
+                              <Select
+                                value={route.providerId}
+                                onValueChange={(value) =>
+                                  handleCustomRouteProviderChange(
+                                    index,
+                                    routeIndex,
+                                    value,
+                                  )
+                                }
+                              >
+                                <SelectTrigger
+                                  className="min-w-0 select-fade-value"
+                                  aria-label={t(
+                                    "codexConfig.customColumnProvider",
+                                    {
+                                      defaultValue: "?????",
+                                    },
+                                  )}
+                                >
+                                  <SelectValue
+                                    placeholder={t(
+                                      "codexConfig.customProviderPlaceholder",
+                                      {
+                                        defaultValue: "?????",
+                                      },
+                                    )}
+                                  />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {codexProviders
+                                    .filter(
+                                      (provider) =>
+                                        !(
+                                          !enableOfficialLogin &&
+                                          provider.id ===
+                                            CODEX_OFFICIAL_PROVIDER_ID
+                                        ),
+                                    )
+                                    .map((provider) => (
+                                      <SelectItem
+                                        key={provider.id}
+                                        value={provider.id}
+                                      >
+                                        {provider.name}
+                                      </SelectItem>
+                                    ))}
+                                </SelectContent>
+                              </Select>
+                              <ModelInputWithFetch
+                                id={`custom-upstream-${index}-${routeIndex}`}
+                                value={route.upstreamModel ?? row.model}
+                                onChange={(value) =>
+                                  handleCustomRouteModelChange(
+                                    index,
+                                    routeIndex,
+                                    value,
+                                  )
+                                }
+                                placeholder={t(
+                                  "codexConfig.catalogColumnModel",
+                                  {
+                                    defaultValue: "??????",
+                                  },
+                                )}
+                                ariaLabel={t("codexConfig.catalogColumnModel", {
+                                  defaultValue: "??????",
+                                })}
+                                fetchedModels={(
+                                  customCatalogByProvider[route.providerId] ??
+                                  []
+                                ).map((model) => ({
+                                  id: model.model,
+                                  ownedBy:
+                                    codexProviders.find(
+                                      (p) => p.id === route.providerId,
+                                    )?.name ?? "Catalog",
+                                }))}
+                                isLoading={false}
+                                disabled={!route.providerId}
+                              />
+                              <div className="flex items-center gap-1">
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                  disabled={routeIndex === 0}
+                                  onClick={() =>
+                                    handleMoveCustomModelRoute(
+                                      index,
+                                      routeIndex,
+                                      -1,
+                                    )
+                                  }
+                                  aria-label={t(
+                                    "codexConfig.moveCustomRouteUp",
+                                    { defaultValue: "??" },
+                                  )}
+                                >
+                                  <ArrowUp className="h-4 w-4" />
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                  disabled={
+                                    routeIndex === row.routes.length - 1
+                                  }
+                                  onClick={() =>
+                                    handleMoveCustomModelRoute(
+                                      index,
+                                      routeIndex,
+                                      1,
+                                    )
+                                  }
+                                  aria-label={t(
+                                    "codexConfig.moveCustomRouteDown",
+                                    { defaultValue: "??" },
+                                  )}
+                                >
+                                  <ArrowDown className="h-4 w-4" />
+                                </Button>
+                              </div>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                                disabled={row.routes.length <= 1}
+                                onClick={() =>
+                                  handleRemoveCustomModelRoute(
+                                    index,
+                                    routeIndex,
+                                  )
+                                }
+                                aria-label={t("codexConfig.removeCustomRoute", {
+                                  defaultValue: "????",
+                                })}
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </Button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

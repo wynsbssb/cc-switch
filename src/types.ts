@@ -271,6 +271,28 @@ export interface CodexCatalogModel {
   baseInstructions?: string;
 }
 
+// 官方 Codex 供应商的「自定义模型」：对外展示给 Codex 的模型 ID，请求会被
+// 本地代理路由到绑定的 cc-switch 供应商（仅 OpenAI Responses 协议）。
+export interface CodexCustomModelRoute {
+  providerId: string;
+  // ?????????????????????? model?
+  upstreamModel?: string;
+}
+
+export interface CodexCustomModel {
+  model: string;
+  // ??????????????? providerId/upstreamModel?
+  // ?????? routes??????????????????????????
+  providerId?: string;
+  upstreamModel?: string;
+  routes?: CodexCustomModelRoute[];
+  displayName?: string;
+  contextWindow?: string | number;
+  supportsParallelToolCalls?: boolean;
+  inputModalities?: string[];
+  baseInstructions?: string;
+}
+
 // Claude 认证字段类型
 export type ClaudeApiKeyField = "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY";
 

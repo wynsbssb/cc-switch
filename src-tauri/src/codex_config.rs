@@ -5,8 +5,13 @@ use crate::config::{
     atomic_write, delete_file, get_home_dir, path_is_within, read_json_file,
     sanitize_provider_name, write_json_file, write_text_file,
 };
+use crate::database::Database;
 use crate::error::AppError;
-use crate::model_capabilities::{image_input_capability_from_modalities, ImageInputCapability};
+use crate::model_capabilities::{
+    image_input_capability_from_modalities, image_input_capability_from_settings,
+    ImageInputCapability,
+};
+use crate::provider::Provider;
 use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
 use std::fs;
@@ -20,6 +25,20 @@ pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
 /// cleaned up without mistaking a user's own local provider for takeover.
 pub const CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID: &str = "cc-switch-official";
 pub const CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
+pub(crate) const CODEX_OFFICIAL_MODELS_MERGED_KEY: &str = "cc_switch_merged";
+const CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME: &str = "cc-switch-official-models-cache.json";
+const CODEX_OFFICIAL_BASELINE_STATE_KEY: &str = "cc_switch_state";
+const CODEX_OFFICIAL_BASELINE_AWAITING_REFRESH: &str = "awaiting_official_refresh";
+const CODEX_OFFICIAL_BASELINE_CAPTURED_AT_KEY: &str = "cc_switch_captured_at";
+const CODEX_OFFICIAL_BASELINE_TTL_SECONDS: i64 = 300;
+const CODEX_OFFICIAL_BASELINE_CLOCK_SKEW_SECONDS: i64 = 60;
+/// 官方 Codex 供应商 settings_config 里存放「自定义模型」的 key。
+/// 每条包含：model（对外展示给 Codex 的 ID）、providerId（绑定的 cc-switch
+/// 供应商）、upstreamModel（可选，发往上游的真实模型名）等。
+pub(crate) const CODEX_CUSTOM_MODELS_KEY: &str = "codexCustomModels";
+/// 官方 Codex 供应商「启用官方登录」开关。关闭时进入聚合模式：
+/// 不要求 ChatGPT 登录，模型列表来自下方配置的多个供应商，按模型路由。
+pub(crate) const CODEX_OFFICIAL_LOGIN_KEY: &str = "enableOfficialLogin";
 const CODEX_PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
 #[cfg(target_os = "windows")]
@@ -136,6 +155,24 @@ pub enum CodexCatalogToolProfile {
     Anthropic,
 }
 
+pub type CodexCustomCatalogProviderResolver<'a> = dyn Fn(&str) -> Option<Provider> + 'a;
+
+pub(crate) fn resolve_codex_custom_catalog_provider_from_db(
+    db: &Database,
+    provider_id: &str,
+) -> Option<Provider> {
+    match db.get_provider_by_id(provider_id, "codex") {
+        Ok(Some(provider)) => Some(provider),
+        Ok(None) => None,
+        Err(error) => {
+            log::warn!(
+                "[codex] 读取自定义模型绑定供应商 `{provider_id}` 失败，将忽略对应目录条目: {error}"
+            );
+            None
+        }
+    }
+}
+
 impl CodexCatalogToolProfile {
     /// Pick the catalog tool profile from a provider's `apiFormat` meta value.
     ///
@@ -178,6 +215,38 @@ pub fn get_codex_config_dir() -> PathBuf {
 /// 获取 Codex auth.json 路径
 pub fn get_codex_auth_path() -> PathBuf {
     get_codex_config_dir().join("auth.json")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexAuthCredentials {
+    pub access_token: String,
+    pub account_id: Option<String>,
+}
+
+fn codex_auth_credentials_from_value(value: &Value) -> Option<CodexAuthCredentials> {
+    let tokens = value.get("tokens")?;
+    let access_token = tokens
+        .get("access_token")?
+        .as_str()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?
+        .to_string();
+    let account_id = tokens
+        .get("account_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    Some(CodexAuthCredentials {
+        access_token,
+        account_id,
+    })
+}
+
+/// 读取 `auth.json` 里的 ChatGPT access token 与账号 ID，用于拉取官方 Codex 模型列表。
+pub(crate) fn read_codex_auth_credentials() -> Option<CodexAuthCredentials> {
+    let value: Value = read_json_file(&get_codex_auth_path()).ok()?;
+    codex_auth_credentials_from_value(&value)
 }
 
 /// 获取 Codex config.toml 路径
@@ -470,6 +539,11 @@ pub fn codex_live_auth_is_stale_third_party_residue(live_auth: &Value) -> bool {
 /// third-party API key, so Codex shows its login screen instead of sending
 /// the wrong key to the official endpoint (401 with no way to re-login).
 ///
+/// 关闭官方登录（聚合模式）时跳过：该模式下 Codex 根本不走 ChatGPT 登录，
+/// 模型全部由本地代理按模型路由到各个供应商，删除 auth.json 只会让 Codex
+/// 误以为未登录而弹出登录页。保留现有文件（哪怕只是第三方 key）也不影响
+/// 路由，代理会为每个请求使用绑定供应商自己的凭据。
+///
 /// Deleting the file — not writing `{}` — is deliberate: Codex resolves an
 /// empty object to ChatGPT mode without tokens and errors at bootstrap,
 /// while a missing file yields NotAuthenticated and the login screen,
@@ -485,8 +559,12 @@ pub fn codex_live_auth_is_stale_third_party_residue(live_auth: &Value) -> bool {
 ///
 /// Returns Ok(true) when the file was deleted.
 pub fn clear_stale_codex_live_auth_after_official_switch(
+    settings: &Value,
     db_auth: &Value,
 ) -> Result<bool, AppError> {
+    if !codex_official_login_enabled(settings) {
+        return Ok(false);
+    }
     if codex_auth_has_login_material(db_auth) {
         // A material-carrying official provider gets a full auth write;
         // nothing stale can remain.
@@ -541,7 +619,14 @@ fn codex_catalog_input_modalities(
     model: &str,
     declared_modalities: Option<&[String]>,
 ) -> Vec<String> {
-    let modalities = match image_input_capability_from_modalities(model, declared_modalities) {
+    codex_catalog_input_modalities_from_capability(image_input_capability_from_modalities(
+        model,
+        declared_modalities,
+    ))
+}
+
+fn codex_catalog_input_modalities_from_capability(capability: ImageInputCapability) -> Vec<String> {
+    let modalities = match capability {
         ImageInputCapability::Unsupported => &["text"][..],
         ImageInputCapability::Supported | ImageInputCapability::Unknown => &["text", "image"][..],
     };
@@ -724,6 +809,904 @@ fn codex_catalog_model_specs(settings: &Value) -> Vec<CodexCatalogModelSpec> {
     specs
 }
 
+/// 一条 Codex 自定义模型（官方登录场景下对外展示的“额外模型”）。
+/// 存放在官方 Codex 供应商的 `settings_config.codexCustomModels`。
+#[derive(Debug, Clone)]
+pub(crate) struct CodexCustomModelEntry {
+    /// ??? Codex ????? ID??? slug / ?? body.model?
+    pub model: String,
+    /// ?????? cc-switch Codex ??? ID??????????????
+    pub provider_id: String,
+    /// ????????????????????
+    pub upstream_model: Option<String>,
+    /// ????????????????????????????????
+    pub routes: Vec<CodexCustomModelRoute>,
+    pub display_name: Option<String>,
+    pub context_window: Option<u64>,
+    pub supports_parallel_tool_calls: Option<bool>,
+    pub input_modalities: Option<Vec<String>>,
+    pub base_instructions: Option<String>,
+}
+
+/// ??????????????????
+#[derive(Debug, Clone)]
+pub(crate) struct CodexCustomModelRoute {
+    pub provider_id: String,
+    pub upstream_model: Option<String>,
+}
+
+fn codex_custom_model_routes(item: &Value) -> Vec<CodexCustomModelRoute> {
+    let Some(routes) = item.get("routes").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    routes
+        .iter()
+        .filter_map(|route| {
+            let provider_id = route
+                .get("providerId")
+                .or_else(|| route.get("provider_id"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)?;
+            Some(CodexCustomModelRoute {
+                provider_id,
+                upstream_model: route
+                    .get("upstreamModel")
+                    .or_else(|| route.get("upstream_model"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+/// ?? `settings_config[CODEX_CUSTOM_MODELS_KEY]`??? snake_case ????
+pub(crate) fn codex_custom_model_entries(settings: &Value) -> Vec<CodexCustomModelEntry> {
+    let Some(items) = settings
+        .get(CODEX_CUSTOM_MODELS_KEY)
+        .and_then(|items| items.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for item in items {
+        let Some(model) = item
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        else {
+            log::warn!("[codex] ????/? model ????????: {item}");
+            continue;
+        };
+
+        let top_level_provider = item
+            .get("providerId")
+            .or_else(|| item.get("provider_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        let top_level_upstream = item
+            .get("upstreamModel")
+            .or_else(|| item.get("upstream_model"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+
+        let mut parsed_routes = codex_custom_model_routes(item);
+        if parsed_routes.is_empty() {
+            let Some(provider_id) = top_level_provider else {
+                log::warn!("[codex] ???? providerId/routes ????????: {item}");
+                continue;
+            };
+            parsed_routes.push(CodexCustomModelRoute {
+                provider_id,
+                upstream_model: top_level_upstream.clone(),
+            });
+        }
+
+        let primary_route = parsed_routes[0].clone();
+        let provider_id = primary_route.provider_id.clone();
+        let upstream_model = primary_route
+            .upstream_model
+            .clone()
+            .or_else(|| top_level_upstream.clone());
+
+        // ?? key ?????????? `[1M]` ????????????
+        // `foo` ? `foo[1M]` ????????????????????
+        let dedup_key =
+            crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(model).to_string();
+        if !seen.insert(dedup_key) {
+            log::warn!("[codex] ???????????? `{model}`????????");
+            continue;
+        }
+        entries.push(CodexCustomModelEntry {
+            model: model.to_string(),
+            provider_id,
+            upstream_model,
+            routes: parsed_routes,
+            display_name: item
+                .get("displayName")
+                .or_else(|| item.get("display_name"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string),
+            context_window: parse_codex_positive_u64(
+                item.get("contextWindow")
+                    .or_else(|| item.get("context_window")),
+            ),
+            supports_parallel_tool_calls: item
+                .get("supportsParallelToolCalls")
+                .or_else(|| item.get("supports_parallel_tool_calls"))
+                .and_then(|value| value.as_bool()),
+            input_modalities: item
+                .get("inputModalities")
+                .or_else(|| item.get("input_modalities"))
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty()),
+            base_instructions: item
+                .get("baseInstructions")
+                .or_else(|| item.get("base_instructions"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string),
+        });
+    }
+    entries
+}
+
+pub(crate) fn codex_custom_models_nonempty(settings: &Value) -> bool {
+    !codex_custom_model_entries(settings).is_empty()
+}
+
+pub(crate) fn merge_codex_custom_catalog_entries(
+    models: &mut Vec<Value>,
+    settings: &Value,
+    custom_entries: Vec<Value>,
+) -> bool {
+    let custom_slots: HashSet<String> = codex_custom_model_entries(settings)
+        .into_iter()
+        .map(|entry| {
+            crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(&entry.model).to_string()
+        })
+        .collect();
+
+    // A configured custom slot owns the public model name even when its bound
+    // provider is unavailable. Otherwise a colliding official row would remain
+    // visible even though request routing cannot serve it.
+    let mut pending: Vec<(String, Value)> = custom_entries
+        .into_iter()
+        .filter_map(|entry| {
+            let slug = entry.get("slug").and_then(Value::as_str)?;
+            let normalized =
+                crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(slug).to_string();
+            Some((normalized, entry))
+        })
+        .collect();
+
+    let mut changed = false;
+    models.retain_mut(|model| {
+        let Some(slug) = model.get("slug").and_then(Value::as_str) else {
+            return true;
+        };
+        let normalized = crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(slug);
+        if let Some(index) = pending
+            .iter()
+            .position(|(custom_slug, _)| custom_slug == normalized)
+        {
+            let replacement = pending.remove(index).1;
+            changed |= *model != replacement;
+            *model = replacement;
+            true
+        } else {
+            let keep = !custom_slots.contains(normalized);
+            changed |= !keep;
+            keep
+        }
+    });
+    changed |= !pending.is_empty();
+    models.extend(pending.into_iter().map(|(_, entry)| entry));
+    changed
+}
+
+/// 官方 Codex 供应商是否启用官方登录（缺省开启，保持既有行为）。
+pub(crate) fn codex_official_login_enabled(settings: &Value) -> bool {
+    settings
+        .get(CODEX_OFFICIAL_LOGIN_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
+}
+
+/// 官方 Codex 供应商（未启用官方登录）接管时刷新 `models_cache.json`。
+///
+/// Codex 桌面端（app-server）的模型列表流程不走本地代理的 `/v1/models`：
+/// 它先读 `~/.codex/models_cache.json`（300 秒 TTL），失效后才尝试从
+/// `chatgpt.com/backend-api` 远程拉取（未登录时 401，最终回退到内置静态
+/// 模型列表）。因此聚合模式下必须主动把自定义模型写入这份缓存，并刷新
+/// `fetched_at`，否则桌面端永远只显示官方内置模型。
+///
+/// 聚合模式（官方登录关闭）只包含映射到供应商的自定义模型：官方模型请求
+/// 会被本地代理拒绝（`RequestContext`），把它们留在缓存里只会显示成可选
+/// 却实际不可用。因此不再克隆旧缓存里的官方/残留条目，仅从当前
+/// `codexCustomModels` 映射重建。
+fn write_codex_models_cache_for_aggregate_at(
+    codex_dir: PathBuf,
+    settings: &Value,
+    config_text: &str,
+    custom_provider_resolver: Option<&CodexCustomCatalogProviderResolver<'_>>,
+) -> Result<(), AppError> {
+    if codex_official_login_enabled(settings) {
+        return Ok(());
+    }
+
+    let mut models: Vec<Value> = Vec::new();
+    let custom_entries = codex_custom_catalog_entries(
+        settings,
+        config_text,
+        CodexCatalogToolProfile::NativeResponses,
+        custom_provider_resolver,
+    )?;
+    merge_codex_custom_catalog_entries(&mut models, settings, custom_entries);
+
+    write_models_cache_json(&codex_dir, models)?;
+    log::info!("[codex] models_cache.json refreshed for aggregate mode");
+    Ok(())
+}
+
+/// 官方登录 + 自定义模型时刷新 `models_cache.json`。
+///
+/// 桌面端读这份缓存展示模型列表，跳过写入会让自定义模型在官方登录模式下
+/// 不可见。合并保留缓存中已有的官方模型条目（官方登录下可路由），再追加/
+/// 覆盖当前配置的自定义条目（同名时自定义优先）。
+///
+/// 仅在现有缓存里有可靠官方基线时写入：缓存缺失/为空/还是聚合模式写的
+/// （cc-switch 生成的 etag）时删除 live 缓存，让 Codex 桌面端立即拉官方模型。
+/// 否则把一个没有官方模型的缓存标成 fresh（300s TTL），会阻断桌面端恢复
+/// 真实官方目录，自定义模型也会一直排挤掉官方模型。
+fn write_codex_models_cache_for_official_login_at(
+    codex_dir: PathBuf,
+    settings: &Value,
+    config_text: &str,
+    custom_provider_resolver: Option<&CodexCustomCatalogProviderResolver<'_>>,
+) -> Result<(), AppError> {
+    let live_cache: Value = fs::read_to_string(codex_dir.join("models_cache.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| json!({ "models": [] }));
+
+    let Some(cache) = prepare_codex_official_models_baseline(&codex_dir, &live_cache)? else {
+        log::info!("[codex] official-login aggregation: 等待 Codex 重新拉取官方基线");
+        return Ok(());
+    };
+
+    let mut models: Vec<Value> = cache
+        .get("models")
+        .and_then(|models| models.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let custom_entries = codex_custom_catalog_entries(
+        settings,
+        config_text,
+        CodexCatalogToolProfile::NativeResponses,
+        custom_provider_resolver,
+    )?;
+    if merge_codex_custom_catalog_entries(&mut models, settings, custom_entries) {
+        write_models_cache_json(&codex_dir, models)?;
+        log::info!("[codex] models_cache.json refreshed for official-login aggregation");
+    } else if !codex_cache_is_reliable_official_baseline(&live_cache) {
+        crate::config::write_json_file(&codex_dir.join("models_cache.json"), &cache)?;
+        log::info!("[codex] official-login aggregation restored the clean official cache");
+    }
+    Ok(())
+}
+
+/// 该缓存是否为 cc-switch 自己生成的（聚合模式/无官方基线时写入），而非
+/// Codex 桌面端从官方后端拉取后落盘的。区分两种来源用于判断官方基线可靠性。
+fn codex_cache_has_cc_switch_etag(cache: &Value) -> bool {
+    cache
+        .get("etag")
+        .and_then(|value| value.as_str())
+        .is_some_and(|etag| etag.starts_with("W/\"cc-switch-"))
+}
+
+fn codex_cache_is_reliable_official_baseline(cache: &Value) -> bool {
+    cache
+        .get("models")
+        .and_then(|models| models.as_array())
+        .is_some_and(|models| !models.is_empty())
+        && !codex_cache_has_cc_switch_etag(cache)
+        && !cache
+            .get(CODEX_OFFICIAL_MODELS_MERGED_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+/// Whether the live cache contains cc-switch-owned state that must be restored
+/// or cleared when Codex takeover ends.
+///
+/// Starting takeover is not sufficient evidence: the process can stop before
+/// publishing a replacement cache, in which case the existing official cache
+/// must remain untouched.
+fn codex_model_label_key(label: &str) -> String {
+    label
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_alphanumeric())
+        .collect()
+}
+
+fn codex_cache_has_legacy_custom_models(cache: &Value, provider_settings: Option<&Value>) -> bool {
+    let Some(models) = cache.get("models").and_then(Value::as_array) else {
+        return false;
+    };
+    if models.iter().any(|model| {
+        model
+            .get("priority")
+            .and_then(Value::as_u64)
+            .is_some_and(|priority| priority >= 1000)
+    }) {
+        return true;
+    }
+
+    let Some(settings) = provider_settings else {
+        return false;
+    };
+    codex_custom_model_entries(settings).iter().any(|entry| {
+        let Some(display_name) = entry.display_name.as_deref() else {
+            return false;
+        };
+        if codex_model_label_key(display_name) == codex_model_label_key(&entry.model) {
+            return false;
+        }
+        models.iter().any(|model| {
+            model.get("slug").and_then(Value::as_str) == Some(entry.model.as_str())
+                && model.get("display_name").and_then(Value::as_str) == Some(display_name)
+        })
+    })
+}
+
+pub(crate) fn codex_models_cache_needs_takeover_cleanup(
+    codex_dir: &Path,
+    provider_settings: Option<&Value>,
+) -> bool {
+    let baseline_exists = codex_dir
+        .join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME)
+        .exists();
+    let live_cache = fs::read_to_string(codex_dir.join("models_cache.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+
+    match live_cache {
+        Some(cache) => {
+            codex_cache_has_cc_switch_etag(&cache)
+                || cache
+                    .get(CODEX_OFFICIAL_MODELS_MERGED_KEY)
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                || codex_cache_has_legacy_custom_models(&cache, provider_settings)
+                || (baseline_exists && !codex_cache_is_reliable_official_baseline(&cache))
+        }
+        None => baseline_exists,
+    }
+}
+
+#[derive(Debug)]
+enum CodexOfficialBaseline {
+    Ready(Value),
+    AwaitingRefresh,
+}
+
+fn prepare_codex_official_models_baseline(
+    codex_dir: &Path,
+    live_cache: &Value,
+) -> Result<Option<Value>, AppError> {
+    match load_or_capture_codex_official_models_baseline(codex_dir, live_cache)? {
+        CodexOfficialBaseline::Ready(cache) => Ok(Some(cache)),
+        CodexOfficialBaseline::AwaitingRefresh => {
+            let live_path = codex_dir.join("models_cache.json");
+            if live_path.exists() {
+                fs::remove_file(&live_path).map_err(|e| AppError::io(&live_path, e))?;
+            }
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) fn restore_or_clear_codex_official_models_cache(
+    codex_dir: &Path,
+) -> Result<(), AppError> {
+    let live_path = codex_dir.join("models_cache.json");
+    let live_cache: Value = fs::read_to_string(&live_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| json!({ "models": [] }));
+
+    if let Some(baseline) = prepare_codex_official_models_baseline(codex_dir, &live_cache)? {
+        if !codex_cache_is_reliable_official_baseline(&live_cache) {
+            crate::config::write_json_file(&live_path, &baseline)?;
+        }
+    }
+    Ok(())
+}
+
+fn codex_official_cache_fingerprint(cache: &Value) -> Value {
+    json!({
+        "etag": cache.get("etag").cloned().unwrap_or(Value::Null),
+        "fetched_at": cache.get("fetched_at").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn codex_official_baseline_payload(cache: &Value) -> Value {
+    let mut payload = cache.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.remove(CODEX_OFFICIAL_BASELINE_CAPTURED_AT_KEY);
+    }
+    payload
+}
+
+fn codex_official_baseline_with_capture_time(
+    cache: &Value,
+    captured_at: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    let mut saved = codex_official_baseline_payload(cache);
+    if let Some(object) = saved.as_object_mut() {
+        object.insert(
+            CODEX_OFFICIAL_BASELINE_CAPTURED_AT_KEY.to_string(),
+            Value::String(captured_at.to_rfc3339()),
+        );
+    }
+    saved
+}
+
+pub(crate) fn capture_forwarded_codex_official_models_baseline(
+    catalog: &Value,
+    client_version: &str,
+    etag: Option<&str>,
+) -> Result<bool, AppError> {
+    capture_forwarded_codex_official_models_baseline_at(
+        &get_codex_config_dir(),
+        catalog,
+        client_version,
+        etag,
+    )
+}
+
+fn capture_forwarded_codex_official_models_baseline_at(
+    codex_dir: &Path,
+    catalog: &Value,
+    client_version: &str,
+    etag: Option<&str>,
+) -> Result<bool, AppError> {
+    let client_version = client_version.trim();
+    if codex_cache_has_cc_switch_etag(catalog)
+        || catalog
+            .get(CODEX_OFFICIAL_MODELS_MERGED_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .or_else(|| catalog.get("data").and_then(Value::as_array))
+        .filter(|models| !models.is_empty())
+        .cloned();
+    let (Some(models), Some(mut baseline)) = (models, catalog.as_object().cloned()) else {
+        return Ok(false);
+    };
+    if client_version.is_empty() {
+        return Ok(false);
+    }
+
+    let now = chrono::Utc::now();
+    baseline.insert("models".to_string(), Value::Array(models));
+    baseline.remove("data");
+    baseline.remove(CODEX_OFFICIAL_MODELS_MERGED_KEY);
+    baseline.remove(CODEX_OFFICIAL_BASELINE_STATE_KEY);
+    baseline.remove("rejected_fingerprint");
+    baseline.insert(
+        "fetched_at".to_string(),
+        Value::String(
+            now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                .to_string(),
+        ),
+    );
+    baseline.insert(
+        "client_version".to_string(),
+        Value::String(client_version.to_string()),
+    );
+    if let Some(etag) = etag.map(str::trim).filter(|etag| !etag.is_empty()) {
+        baseline.insert("etag".to_string(), Value::String(etag.to_string()));
+    }
+
+    let baseline = Value::Object(baseline);
+    if !codex_cache_is_reliable_official_baseline(&baseline) {
+        return Ok(false);
+    }
+    let captured = codex_official_baseline_with_capture_time(&baseline, now);
+    crate::config::write_json_file(
+        &codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME),
+        &captured,
+    )?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexOfficialBaselineCaptureState {
+    Missing,
+    Fresh,
+    Expired,
+    Invalid,
+}
+
+fn codex_official_baseline_capture_state(
+    cache: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> CodexOfficialBaselineCaptureState {
+    let Some(raw) = cache.get(CODEX_OFFICIAL_BASELINE_CAPTURED_AT_KEY) else {
+        return CodexOfficialBaselineCaptureState::Missing;
+    };
+    let Some(raw) = raw.as_str() else {
+        return CodexOfficialBaselineCaptureState::Invalid;
+    };
+    let Ok(captured_at) = chrono::DateTime::parse_from_rfc3339(raw) else {
+        return CodexOfficialBaselineCaptureState::Invalid;
+    };
+    let age = now
+        .signed_duration_since(captured_at.with_timezone(&chrono::Utc))
+        .num_seconds();
+    if age < -CODEX_OFFICIAL_BASELINE_CLOCK_SKEW_SECONDS {
+        CodexOfficialBaselineCaptureState::Invalid
+    } else if age >= CODEX_OFFICIAL_BASELINE_TTL_SECONDS {
+        CodexOfficialBaselineCaptureState::Expired
+    } else {
+        CodexOfficialBaselineCaptureState::Fresh
+    }
+}
+
+fn codex_awaiting_official_refresh(cache: &Value) -> Value {
+    json!({
+        CODEX_OFFICIAL_BASELINE_STATE_KEY: CODEX_OFFICIAL_BASELINE_AWAITING_REFRESH,
+        "rejected_fingerprint": codex_official_cache_fingerprint(cache),
+    })
+}
+
+fn load_or_capture_codex_official_models_baseline(
+    codex_dir: &Path,
+    live_cache: &Value,
+) -> Result<CodexOfficialBaseline, AppError> {
+    let baseline_path = codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME);
+    let saved: Option<Value> = fs::read_to_string(&baseline_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+
+    let now = chrono::Utc::now();
+    if let Some(saved) = saved.as_ref() {
+        if codex_cache_is_reliable_official_baseline(saved) {
+            let live_is_official = codex_cache_is_reliable_official_baseline(live_cache);
+            let live_is_new_snapshot = live_is_official
+                && codex_official_cache_fingerprint(saved)
+                    != codex_official_cache_fingerprint(live_cache);
+            if live_is_new_snapshot {
+                let captured = codex_official_baseline_with_capture_time(live_cache, now);
+                crate::config::write_json_file(&baseline_path, &captured)?;
+                return Ok(CodexOfficialBaseline::Ready(live_cache.clone()));
+            }
+            match codex_official_baseline_capture_state(saved, now) {
+                CodexOfficialBaselineCaptureState::Expired
+                | CodexOfficialBaselineCaptureState::Invalid => {
+                    let awaiting = codex_awaiting_official_refresh(saved);
+                    crate::config::write_json_file(&baseline_path, &awaiting)?;
+                    return Ok(CodexOfficialBaseline::AwaitingRefresh);
+                }
+                CodexOfficialBaselineCaptureState::Missing => {
+                    let captured = codex_official_baseline_with_capture_time(saved, now);
+                    crate::config::write_json_file(&baseline_path, &captured)?;
+                }
+                CodexOfficialBaselineCaptureState::Fresh => {}
+            }
+            return Ok(CodexOfficialBaseline::Ready(
+                codex_official_baseline_payload(saved),
+            ));
+        }
+
+        if saved
+            .get(CODEX_OFFICIAL_BASELINE_STATE_KEY)
+            .and_then(Value::as_str)
+            == Some(CODEX_OFFICIAL_BASELINE_AWAITING_REFRESH)
+        {
+            if codex_cache_is_reliable_official_baseline(live_cache)
+                && saved.get("rejected_fingerprint")
+                    != Some(&codex_official_cache_fingerprint(live_cache))
+            {
+                let captured = codex_official_baseline_with_capture_time(live_cache, now);
+                crate::config::write_json_file(&baseline_path, &captured)?;
+                return Ok(CodexOfficialBaseline::Ready(live_cache.clone()));
+            }
+            return Ok(CodexOfficialBaseline::AwaitingRefresh);
+        }
+    }
+
+    if codex_cache_is_reliable_official_baseline(live_cache) {
+        let awaiting = codex_awaiting_official_refresh(live_cache);
+        crate::config::write_json_file(&baseline_path, &awaiting)?;
+    }
+    Ok(CodexOfficialBaseline::AwaitingRefresh)
+}
+
+/// 写 `models_cache.json`：优先使用当前 Codex CLI 版本，探测失败时才复用
+/// 既有 `client_version`（Codex 按该版本号校验缓存有效性）；无可验证版本时
+/// 拒绝写入。仅刷新 `fetched_at` 与 `etag`，使缓存落在 300 秒 TTL 窗口内。
+fn write_models_cache_json(codex_dir: &Path, models: Vec<Value>) -> Result<(), AppError> {
+    let detected_client_version = detect_codex_cli_client_version();
+    write_models_cache_json_with_client_version(
+        codex_dir,
+        models,
+        detected_client_version.as_deref(),
+    )
+}
+
+fn parse_codex_cli_client_version(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|token| {
+        let version = token.trim_start_matches('v').split(['-', '+']).next()?;
+        let mut parts = version.split('.');
+        let major = parts.next()?;
+        let minor = parts.next()?;
+        let patch = parts.next()?;
+        if parts.next().is_some()
+            || [major, minor, patch]
+                .iter()
+                .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            return None;
+        }
+        Some(format!("{major}.{minor}.{patch}"))
+    })
+}
+
+fn codex_version_command(candidate: &Path) -> Command {
+    let mut command = Command::new(candidate);
+    command.arg("--version").stdin(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+}
+
+fn detect_codex_cli_client_version() -> Option<String> {
+    for candidate in codex_cli_candidates() {
+        let candidate_label = candidate.to_string_lossy();
+        let output = match codex_version_command(&candidate).output() {
+            Ok(output) => output,
+            Err(error) => {
+                log::debug!("failed to run `{candidate_label} --version`: {error}");
+                continue;
+            }
+        };
+        if !output.status.success() {
+            log::debug!(
+                "`{candidate_label} --version` exited with {}",
+                output.status
+            );
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(version) = parse_codex_cli_client_version(&stdout) {
+            return Some(version);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(version) = parse_codex_cli_client_version(&stderr) {
+            return Some(version);
+        }
+        log::debug!("failed to parse Codex version from `{candidate_label} --version`");
+    }
+    None
+}
+
+/// Resolve the client version used by Codex to validate `models_cache.json`.
+/// Prefer a live CLI/Desktop binary; an existing cache is only a fallback for
+/// installations whose executable cannot be launched from CC Switch.
+pub(crate) fn resolve_codex_client_version() -> Option<String> {
+    detect_codex_cli_client_version().or_else(|| {
+        fs::read_to_string(get_codex_config_dir().join("models_cache.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|cache| {
+                cache
+                    .get("client_version")
+                    .and_then(Value::as_str)
+                    .and_then(parse_codex_cli_client_version)
+            })
+    })
+}
+
+fn write_models_cache_json_with_client_version(
+    codex_dir: &Path,
+    models: Vec<Value>,
+    detected_client_version: Option<&str>,
+) -> Result<(), AppError> {
+    let path = codex_dir.join("models_cache.json");
+    let existing: Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| json!({ "models": [] }));
+    let client_version = detected_client_version
+        .and_then(parse_codex_cli_client_version)
+        .or_else(|| {
+            existing
+                .get("client_version")
+                .and_then(Value::as_str)
+                .and_then(parse_codex_cli_client_version)
+        })
+        .ok_or_else(|| {
+            AppError::Message(
+                "Cannot write Codex models cache without a verified Codex client version"
+                    .to_string(),
+            )
+        })?;
+    let _ = load_or_capture_codex_official_models_baseline(codex_dir, &existing)?;
+
+    let now = chrono::Utc::now();
+    let fetched_at = now
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        .to_string();
+    let etag = format!("W/\"cc-switch-{}\"", now.timestamp());
+
+    let updated = json!({
+        "fetched_at": fetched_at,
+        "etag": etag,
+        "client_version": client_version,
+        "models": models,
+    });
+
+    crate::config::write_json_file(&path, &updated)?;
+    Ok(())
+}
+
+/// 切换/接管任意 Codex 供应商后重建 `models_cache.json`（桌面端模型列表的
+/// 来源），使列表始终反映当前供应商而不是残留的旧条目。
+///
+/// - 官方供应商 + 启用官方登录：无自定义模型时恢复 clean sidecar，或删除
+///   cc-switch 残留以触发 ChatGPT 后端拉取；有自定义模型时合并官方模型 + 自定义条目
+///   （见 [`write_codex_models_cache_for_official_login_at`]）；
+/// - 官方供应商 + 关闭官方登录（聚合模式）：仅用当前 `codexCustomModels`
+///   映射重建，清掉残留的官方/旧条目（见 [`write_codex_models_cache_for_aggregate_at`]）；
+/// - 其他供应商：直接用当前供应商自己的模型目录重建，清掉残留的官方/旧条目。
+pub fn write_codex_models_cache_for_provider(
+    provider: &Provider,
+    config_text: &str,
+    custom_provider_resolver: Option<&CodexCustomCatalogProviderResolver<'_>>,
+) -> Result<(), AppError> {
+    write_codex_models_cache_for_provider_at(
+        get_codex_config_dir(),
+        provider,
+        config_text,
+        custom_provider_resolver,
+    )
+}
+
+fn write_codex_models_cache_for_provider_at(
+    codex_dir: PathBuf,
+    provider: &Provider,
+    config_text: &str,
+    custom_provider_resolver: Option<&CodexCustomCatalogProviderResolver<'_>>,
+) -> Result<(), AppError> {
+    let settings = &provider.settings_config;
+
+    if crate::proxy::providers::is_codex_official_provider(provider) {
+        if codex_official_login_enabled(settings) {
+            // 官方登录 + 自定义模型：桌面端读 models_cache.json，需合并写入
+            // 官方与自定义模型，否则自定义模型不可见。
+            if codex_custom_models_nonempty(settings) {
+                return write_codex_models_cache_for_official_login_at(
+                    codex_dir,
+                    settings,
+                    config_text,
+                    custom_provider_resolver,
+                );
+            }
+            return restore_or_clear_codex_official_models_cache(&codex_dir);
+        }
+        return write_codex_models_cache_for_aggregate_at(
+            codex_dir,
+            settings,
+            config_text,
+            custom_provider_resolver,
+        );
+    }
+
+    let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(provider);
+    let catalog = codex_model_catalog_from_settings(settings, config_text, profile, None)?;
+    match catalog {
+        Some(catalog) => {
+            let models: Vec<Value> = catalog
+                .get("models")
+                .and_then(|models| models.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let model_count = models.len();
+            write_models_cache_json(&codex_dir, models)?;
+            log::info!(
+                "[codex] models_cache.json rebuilt for provider `{}`: {} models",
+                provider.name,
+                model_count
+            );
+        }
+        None => {
+            // 无 modelCatalog（只有顶层 model，如仓库自带的自定义供应商模板）：
+            // 从配置的 model 派生单条缓存，桌面端至少能发现默认模型；连 model
+            // 都没有则跳过，避免把空列表标成 fresh 阻断桌面端发现模型。
+            let Some(model) = codex_top_level_model(config_text) else {
+                return Ok(());
+            };
+            let Some(entry) = codex_single_model_cache_entry(&model, profile, config_text) else {
+                return Ok(());
+            };
+            write_models_cache_json(&codex_dir, vec![entry])?;
+            log::info!(
+                "[codex] models_cache.json rebuilt for provider `{}`: 1 model from config",
+                provider.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 无 `modelCatalog` 时从配置顶层 `model` 派生单条缓存条目。
+fn codex_single_model_cache_entry(
+    model: &str,
+    profile: CodexCatalogToolProfile,
+    config_text: &str,
+) -> Option<Value> {
+    let template = match profile {
+        CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic => {
+            load_codex_native_responses_template()
+        }
+        CodexCatalogToolProfile::ProxyChat => load_codex_model_catalog_template().ok()?,
+    };
+    let spec = CodexCatalogModelSpec {
+        model: model.to_string(),
+        display_name: None,
+        context_window: None,
+        supports_parallel_tool_calls: None,
+        input_modalities: None,
+        base_instructions: None,
+    };
+    let default_context_window =
+        extract_codex_top_level_u64(config_text, "model_context_window").unwrap_or(128_000);
+    Some(codex_catalog_model_entry(
+        &template,
+        &spec,
+        0,
+        profile,
+        default_context_window,
+    ))
+}
+
+/// 加载 Codex 内置的完整官方模型目录（`models_cache.json`，Codex 连接
+/// OpenAI 后自行写入），用于在保留官方模型选择的同时合并自定义模型条目。
+/// 缓存缺失时回退到内置 gpt-5.5 模板（降级：只展示这一个官方模型）。
 fn find_codex_model_template(catalog: &Value) -> Option<Value> {
     catalog
         .get("models")
@@ -902,6 +1885,17 @@ fn codex_cli_candidates() -> Vec<PathBuf> {
         push_codex_cli_candidate(&mut candidates, &mut seen, PathBuf::from(candidate));
     }
 
+    // 桌面自带 codex 二进制的候选始终记录（与 PATH 候选一致，不要求此刻存在）：
+    // 消费方对无法启动的候选会跳过，存在性在运行时判断。若按存在性过滤，
+    // 干净环境/CI 上就会漏掉这条路径，检测不到桌面版自带的 Codex。
+    #[cfg(target_os = "macos")]
+    for candidate in [
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+        "/Applications/ChatGPT Classic.app/Contents/Resources/codex",
+    ] {
+        push_codex_cli_candidate(&mut candidates, &mut seen, PathBuf::from(candidate));
+    }
+
     push_env_codex_cli_candidates(&mut candidates, &mut seen);
     push_home_codex_cli_candidates(&mut candidates, &mut seen, &get_home_dir());
 
@@ -1036,22 +2030,28 @@ fn codex_official_vendor_catalog_models(
     None
 }
 
-/// Build one catalog entry from an official vendor catalog: match the user's
-/// model id against the vendor entries by slug; an unknown id clones the
-/// vendor's first (flagship) entry so it keeps the gateway's capability
-/// profile without impersonating the flagship. The official entry is
-/// authoritative — no tool-profile stripping — but explicit per-row user
-/// overrides still win.
+/// Build one catalog entry from an official vendor catalog. `template_model`
+/// selects the vendor row whose capabilities should be cloned; normal provider
+/// catalogs omit it and match `spec.model`, while aggregate aliases pass their
+/// actual upstream model. An unknown id clones the vendor's first (flagship)
+/// entry. The public identity always comes from `spec`, and explicit per-row
+/// user overrides still win.
 fn codex_vendor_catalog_model_entry(
     vendor_models: &[Value],
     spec: &CodexCatalogModelSpec,
     priority: usize,
+    template_model: Option<&str>,
 ) -> Value {
+    let preserve_public_identity = template_model.is_some();
+    let template_model = template_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(&spec.model);
     let matched = vendor_models.iter().find(|entry| {
         entry
             .get("slug")
             .and_then(|slug| slug.as_str())
-            .is_some_and(|slug| slug.eq_ignore_ascii_case(&spec.model))
+            .is_some_and(|slug| slug.eq_ignore_ascii_case(template_model))
     });
     let mut entry = match matched {
         Some(found) => found.clone(),
@@ -1061,7 +2061,7 @@ fn codex_vendor_catalog_model_entry(
         return json!({});
     };
 
-    if matched.is_none() {
+    if matched.is_none() || preserve_public_identity {
         let display_name = spec.display_name.as_deref().unwrap_or(&spec.model);
         entry_obj.insert("slug".to_string(), json!(spec.model));
         entry_obj.insert("display_name".to_string(), json!(display_name));
@@ -1194,11 +2194,147 @@ fn codex_model_catalog_from_specs(
     json!({ "models": entries })
 }
 
+/// 为 Codex 自定义模型构建原生 Responses 目录条目（官方供应商场景）。
+pub(crate) fn codex_custom_catalog_entries(
+    settings: &Value,
+    config_text: &str,
+    fallback_profile: CodexCatalogToolProfile,
+    resolve_provider: Option<&CodexCustomCatalogProviderResolver<'_>>,
+) -> Result<Vec<Value>, AppError> {
+    let entries = codex_custom_model_entries(settings);
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let native_template = load_codex_native_responses_template();
+    let mut proxy_chat_template = None;
+    let mut catalog_entries = Vec::with_capacity(entries.len());
+
+    for (index, entry) in entries.iter().enumerate() {
+        let bound_provider = match resolve_provider {
+            Some(resolve) => {
+                let Some(provider) = resolve(&entry.provider_id) else {
+                    log::warn!(
+                        "[codex] 忽略自定义模型 `{}`：绑定供应商 `{}` 不存在",
+                        entry.model,
+                        entry.provider_id
+                    );
+                    continue;
+                };
+                Some(provider)
+            }
+            None => None,
+        };
+        let profile = bound_provider
+            .as_ref()
+            .map(crate::proxy::providers::resolve_codex_catalog_tool_profile)
+            .unwrap_or(fallback_profile);
+        let bound_config_text = bound_provider.as_ref().and_then(|provider| {
+            provider
+                .settings_config
+                .get("config")
+                .and_then(Value::as_str)
+        });
+        let default_context_window = match bound_provider.as_ref() {
+            Some(_) => bound_config_text
+                .and_then(|text| extract_codex_top_level_u64(text, "model_context_window"))
+                .unwrap_or(128_000),
+            None => {
+                extract_codex_top_level_u64(config_text, "model_context_window").unwrap_or(128_000)
+            }
+        };
+        let provider_default_model = bound_provider
+            .as_ref()
+            .and_then(crate::proxy::providers::codex_provider_upstream_model);
+        let capability_model = entry
+            .upstream_model
+            .as_deref()
+            .or(provider_default_model.as_deref());
+        let spec = CodexCatalogModelSpec {
+            model: entry.model.clone(),
+            display_name: entry.display_name.clone(),
+            context_window: entry.context_window,
+            supports_parallel_tool_calls: entry.supports_parallel_tool_calls,
+            input_modalities: entry.input_modalities.clone().or_else(|| {
+                capability_model.map(|model| {
+                    bound_provider.as_ref().map_or_else(
+                        || codex_catalog_input_modalities(model, None),
+                        |provider| {
+                            codex_catalog_input_modalities_from_capability(
+                                image_input_capability_from_settings(
+                                    &provider.settings_config,
+                                    model,
+                                    true,
+                                ),
+                            )
+                        },
+                    )
+                })
+            }),
+            base_instructions: entry.base_instructions.clone(),
+        };
+        if let Some(vendor_models) =
+            bound_config_text.and_then(|text| codex_official_vendor_catalog_models(text, profile))
+        {
+            catalog_entries.push(codex_vendor_catalog_model_entry(
+                &vendor_models,
+                &spec,
+                index,
+                capability_model,
+            ));
+            continue;
+        }
+
+        let template = match profile {
+            CodexCatalogToolProfile::ProxyChat => {
+                if proxy_chat_template.is_none() {
+                    proxy_chat_template = Some(load_codex_model_catalog_template()?);
+                }
+                proxy_chat_template
+                    .as_ref()
+                    .expect("ProxyChat template initialized")
+            }
+            CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic => {
+                &native_template
+            }
+        };
+        catalog_entries.push(codex_catalog_model_entry(
+            template,
+            &spec,
+            index,
+            profile,
+            default_context_window,
+        ));
+    }
+
+    Ok(catalog_entries)
+}
+
 fn codex_model_catalog_from_settings(
     settings: &Value,
     config_text: &str,
     profile: CodexCatalogToolProfile,
+    custom_provider_resolver: Option<&CodexCustomCatalogProviderResolver<'_>>,
 ) -> Result<Option<Value>, AppError> {
+    // 官方 Codex 供应商带自定义模型。
+    if codex_custom_models_nonempty(settings) {
+        // 未启用官方登录：聚合模式，目录只包含下方配置的供应商模型（多供应商切换）。
+        if !codex_official_login_enabled(settings) {
+            return Ok(Some(json!({
+                "models": codex_custom_catalog_entries(
+                    settings,
+                    config_text,
+                    CodexCatalogToolProfile::NativeResponses,
+                    custom_provider_resolver,
+                )?
+            })));
+        }
+        // 官方登录模式：不写 model_catalog_json，让 Codex 直接走 /v1/models，
+        // 由本地代理把官方模型与自定义模型合并返回。合并目录文件依赖
+        // models_cache.json 拿官方模型，而登录模式下该缓存不可靠，容易写出
+        // 只有自定义模型、缺官方模型的错误目录。
+        return Ok(None);
+    }
+
     let specs = codex_catalog_model_specs(settings);
     if specs.is_empty() {
         return Ok(None);
@@ -1213,7 +2349,9 @@ fn codex_model_catalog_from_settings(
         let entries: Vec<Value> = specs
             .iter()
             .enumerate()
-            .map(|(index, spec)| codex_vendor_catalog_model_entry(&vendor_models, spec, index))
+            .map(|(index, spec)| {
+                codex_vendor_catalog_model_entry(&vendor_models, spec, index, None)
+            })
             .collect();
         return Ok(Some(json!({ "models": entries })));
     }
@@ -1320,10 +2458,13 @@ pub fn prepare_codex_config_text_with_model_catalog(
     settings: &Value,
     config_text: &str,
     profile: CodexCatalogToolProfile,
+    custom_provider_resolver: Option<&CodexCustomCatalogProviderResolver<'_>>,
 ) -> Result<String, AppError> {
     let catalog_path = get_codex_model_catalog_path();
 
-    if let Some(catalog) = codex_model_catalog_from_settings(settings, config_text, profile)? {
+    if let Some(catalog) =
+        codex_model_catalog_from_settings(settings, config_text, profile, custom_provider_resolver)?
+    {
         let config_text = set_codex_model_catalog_json_field(config_text, Some(&catalog_path))?;
         // Disable web_search only for native gateways on the reject blacklist
         // (MiMo/LongCat/MiniMax by host or model brand; Qwen3-Coder by model).
@@ -1600,9 +2741,15 @@ pub fn prepare_codex_live_config_text_with_optional_catalog(
     settings: &Value,
     config_text: &str,
     profile: CodexCatalogToolProfile,
+    custom_provider_resolver: Option<&CodexCustomCatalogProviderResolver<'_>>,
 ) -> Result<String, AppError> {
-    if settings.get("modelCatalog").is_some() {
-        prepare_codex_config_text_with_model_catalog(settings, config_text, profile)
+    if settings.get("modelCatalog").is_some() || codex_custom_models_nonempty(settings) {
+        prepare_codex_config_text_with_model_catalog(
+            settings,
+            config_text,
+            profile,
+            custom_provider_resolver,
+        )
     } else {
         Ok(config_text.to_string())
     }
@@ -1614,9 +2761,17 @@ pub fn write_codex_provider_live_with_catalog(
     auth: &Value,
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
+    custom_provider_resolver: Option<&CodexCustomCatalogProviderResolver<'_>>,
 ) -> Result<(), AppError> {
     let prepared_config = config_text
-        .map(|text| prepare_codex_config_text_with_model_catalog(settings, text, profile))
+        .map(|text| {
+            prepare_codex_config_text_with_model_catalog(
+                settings,
+                text,
+                profile,
+                custom_provider_resolver,
+            )
+        })
         .transpose()?;
 
     write_codex_live_for_provider(category, auth, prepared_config.as_deref())
@@ -1780,10 +2935,11 @@ pub fn read_codex_live_settings() -> Result<Value, AppError> {
 fn codex_official_provider_table(
     base_url: Option<&str>,
     supports_websockets: bool,
+    requires_openai_auth: bool,
 ) -> toml_edit::Table {
     let mut table = toml_edit::Table::new();
     table["name"] = toml_edit::value("OpenAI");
-    table["requires_openai_auth"] = toml_edit::value(true);
+    table["requires_openai_auth"] = toml_edit::value(requires_openai_auth);
     table["supports_websockets"] = toml_edit::value(supports_websockets);
     table["wire_api"] = toml_edit::value("responses");
     if let Some(base_url) = base_url {
@@ -1793,7 +2949,7 @@ fn codex_official_provider_table(
 }
 
 fn codex_unified_official_provider_table() -> toml_edit::Table {
-    codex_official_provider_table(None, true)
+    codex_official_provider_table(None, true, true)
 }
 
 fn remove_codex_proxy_placeholders_from_providers(providers: &mut toml_edit::Table) {
@@ -1824,9 +2980,21 @@ fn remove_codex_proxy_placeholders_from_providers(providers: &mut toml_edit::Tab
 /// The resulting custom provider explicitly opts into OpenAI authentication,
 /// so Codex forwards its existing ChatGPT login to the local `/responses`
 /// endpoint.  No API key or bearer placeholder is written to `auth.json`.
+#[cfg(test)]
 pub fn apply_codex_official_proxy_route(
     config_text: &str,
     proxy_base_url: &str,
+) -> Result<String, AppError> {
+    apply_codex_official_proxy_route_with_auth(config_text, proxy_base_url, true)
+}
+
+/// 同 [`apply_codex_official_proxy_route`]，但允许关闭 `requires_openai_auth`：
+/// 未启用官方登录（聚合模式）时 Codex 不会要求 OpenAI 登录，模型全部来自
+/// 本地代理按模型路由到各个供应商。
+pub fn apply_codex_official_proxy_route_with_auth(
+    config_text: &str,
+    proxy_base_url: &str,
+    requires_openai_auth: bool,
 ) -> Result<String, AppError> {
     let mut doc = config_text
         .parse::<DocumentMut>()
@@ -1855,7 +3023,14 @@ pub fn apply_codex_official_proxy_route(
     remove_codex_proxy_placeholders_from_providers(&mut providers);
 
     // The local proxy currently exposes HTTP/SSE, not Codex websocket routes.
-    let table = codex_official_provider_table(Some(proxy_base_url), false);
+    let mut table =
+        codex_official_provider_table(Some(proxy_base_url), false, requires_openai_auth);
+    if !requires_openai_auth {
+        // 聚合模式（关闭官方登录）：不给 Codex 任何凭据它会直接弹登录页。
+        // 占位 token 只用于满足客户端的认证检查，实际请求由本地代理按模型
+        // 路由，并把鉴权替换为绑定供应商自己的凭据（不会把占位符发到上游）。
+        table["experimental_bearer_token"] = toml_edit::value(CODEX_PROXY_AUTH_PLACEHOLDER);
+    }
 
     providers.insert(
         CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
@@ -2355,6 +3530,7 @@ pub fn remove_codex_toml_base_url_if(toml_str: &str, predicate: impl Fn(&str) ->
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
 
     #[test]
     fn catalog_tool_profile_from_api_format() {
@@ -2443,6 +3619,39 @@ command = "example"
             Some(false)
         );
         assert!(codex_config_has_official_proxy_route(&output));
+    }
+
+    #[test]
+    fn official_proxy_route_aggregate_mode_injects_bearer_placeholder() {
+        // 关闭官方登录（聚合模式）：Codex 必须拿到一个占位凭据才不弹登录页。
+        let output =
+            apply_codex_official_proxy_route_with_auth("", "http://127.0.0.1:15721/v1", false)
+                .expect("apply aggregate route");
+        let doc: toml::Value = toml::from_str(&output).expect("parse output");
+
+        assert_eq!(
+            doc.get("model_provider").and_then(toml::Value::as_str),
+            Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+        );
+        let provider = &doc["model_providers"][CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
+        assert_eq!(
+            provider
+                .get("requires_openai_auth")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            provider
+                .get("experimental_bearer_token")
+                .and_then(toml::Value::as_str),
+            Some("PROXY_MANAGED")
+        );
+
+        // 移除接管路由时占位 token 一并被清掉，不残留到恢复后的配置。
+        let cleaned = remove_codex_official_proxy_route(&output).expect("clean aggregate route");
+        let cleaned_doc: toml::Value = toml::from_str(&cleaned).expect("parse cleaned");
+        assert!(cleaned_doc.get("model_provider").is_none());
+        assert!(!cleaned.contains("experimental_bearer_token"));
     }
 
     #[test]
@@ -2755,6 +3964,29 @@ experimental_bearer_token = "stale-table-key"
     }
 
     #[test]
+    fn codex_auth_credentials_parse_token_and_optional_account_id() {
+        let credentials = codex_auth_credentials_from_value(&json!({
+            "tokens": {
+                "access_token": "  official-token  ",
+                "account_id": "  workspace-123  "
+            }
+        }))
+        .expect("parse Codex auth credentials");
+
+        assert_eq!(credentials.access_token, "official-token");
+        assert_eq!(credentials.account_id.as_deref(), Some("workspace-123"));
+
+        let personal = codex_auth_credentials_from_value(&json!({
+            "tokens": {
+                "access_token": "personal-token",
+                "account_id": "   "
+            }
+        }))
+        .expect("parse personal-account credentials");
+        assert_eq!(personal.account_id, None);
+    }
+
+    #[test]
     fn stale_third_party_residue_detection() {
         // Shapes a preserve-off third-party switch leaves behind: cleared.
         assert!(codex_live_auth_is_stale_third_party_residue(&json!({
@@ -2786,6 +4018,58 @@ experimental_bearer_token = "stale-table-key"
         assert!(!codex_live_auth_is_stale_third_party_residue(&json!({
             "OPENAI_API_KEY": ""
         })));
+    }
+
+    #[test]
+    #[serial]
+    fn clear_stale_auth_skipped_when_official_login_disabled() {
+        let dir = tempfile::TempDir::new().expect("create temp home");
+        let original_home = std::env::var("HOME").ok();
+        let original_userprofile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("USERPROFILE", dir.path());
+        crate::settings::reload_settings().expect("reload settings");
+
+        let codex_dir = get_codex_config_dir();
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+        let auth_path = get_codex_auth_path();
+        write_json_file(&auth_path, &json!({ "OPENAI_API_KEY": "sk-third-party" }))
+            .expect("seed stale third-party auth");
+
+        // 聚合模式（关闭官方登录）：不得删除 auth.json，否则 Codex 弹登录。
+        let removed = clear_stale_codex_live_auth_after_official_switch(
+            &json!({ "enableOfficialLogin": false }),
+            &json!({}),
+        )
+        .expect("cleanup must not fail");
+        assert!(!removed, "aggregate mode must not delete auth.json");
+        assert!(
+            auth_path.exists(),
+            "stale auth must be preserved in aggregate mode"
+        );
+
+        // 启用官方登录时仍按原逻辑清理残留的第三方 key。
+        let removed = clear_stale_codex_live_auth_after_official_switch(&json!({}), &json!({}))
+            .expect("cleanup must not fail");
+        assert!(
+            removed,
+            "official login mode still clears stale third-party auth"
+        );
+        assert!(
+            !auth_path.exists(),
+            "stale auth must be deleted for official login mode"
+        );
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("reset settings");
     }
 
     #[test]
@@ -3369,6 +4653,7 @@ base_url = "https://production.api/v1"
             &settings,
             "",
             CodexCatalogToolProfile::NativeResponses,
+            None,
         )
         .expect("native catalog generation should not error")
         .expect("non-empty modelCatalog must yield a catalog");
@@ -3412,6 +4697,376 @@ base_url = "https://production.api/v1"
         assert_eq!(
             entry.get("context_window").and_then(|v| v.as_u64()),
             Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn aggregate_catalog_uses_each_bound_providers_tool_profile() {
+        let db = crate::database::Database::memory().expect("create in-memory database");
+        let mut chat = Provider::with_id(
+            "chat-provider".to_string(),
+            "Chat Provider".to_string(),
+            json!({ "apiFormat": "openai_chat" }),
+            None,
+        );
+        chat.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        let mut native = Provider::with_id(
+            "native-provider".to_string(),
+            "Native Provider".to_string(),
+            json!({ "apiFormat": "openai_responses" }),
+            None,
+        );
+        native.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &chat)
+            .expect("save chat provider");
+        db.save_provider("codex", &native)
+            .expect("save native provider");
+
+        let settings = json!({
+            "codexCustomModels": [
+                {
+                    "model": "gpt-5.4-mini",
+                    "providerId": "chat-provider",
+                    "upstreamModel": "chat-model"
+                },
+                {
+                    "model": "gpt-5.2",
+                    "providerId": "native-provider",
+                    "upstreamModel": "native-model"
+                }
+            ]
+        });
+
+        let resolve_provider =
+            |provider_id: &str| resolve_codex_custom_catalog_provider_from_db(&db, provider_id);
+        let entries = codex_custom_catalog_entries(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+            Some(&resolve_provider),
+        )
+        .expect("build aggregate catalog entries");
+        assert_eq!(
+            entries[0]
+                .get("apply_patch_tool_type")
+                .and_then(|value| value.as_str()),
+            Some("freeform"),
+            "a Chat route must keep the freeform apply_patch surface"
+        );
+        assert!(
+            entries[1].get("apply_patch_tool_type").is_none(),
+            "a native Responses route must suppress freeform apply_patch"
+        );
+    }
+
+    #[test]
+    fn aggregate_catalog_preserves_bound_providers_official_vendor_capabilities() {
+        let mut provider = Provider::with_id(
+            "deepseek-provider".to_string(),
+            "DeepSeek Provider".to_string(),
+            json!({
+                "apiFormat": "openai_responses",
+                "model": "deepseek-v4-pro",
+                "config": DEEPSEEK_NATIVE_CONFIG
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        let settings = json!({
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deepseek-provider",
+                "upstreamModel": "deepseek-v4-pro"
+            }]
+        });
+        let resolve_provider =
+            |provider_id: &str| (provider_id == provider.id).then(|| provider.clone());
+
+        let entries = codex_custom_catalog_entries(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+            Some(&resolve_provider),
+        )
+        .expect("build aggregate catalog entries");
+
+        let entry = &entries[0];
+        assert_eq!(entry.get("slug"), Some(&json!("gpt-5.2")));
+        assert_eq!(entry.get("display_name"), Some(&json!("gpt-5.2")));
+        assert_eq!(entry.get("apply_patch_tool_type"), Some(&json!("freeform")));
+        assert!(entry
+            .get("base_instructions")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with("You are Codex, an agent based on GPT-5")));
+        assert_eq!(entry.get("context_window"), Some(&json!(1_048_576)));
+    }
+
+    #[test]
+    fn aggregate_vendor_catalog_preserves_case_sensitive_public_slot_identity() {
+        let mut provider = Provider::with_id(
+            "deepseek-provider".to_string(),
+            "DeepSeek Provider".to_string(),
+            json!({
+                "apiFormat": "openai_responses",
+                "model": "deepseek-v4-pro",
+                "config": DEEPSEEK_NATIVE_CONFIG
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        let settings = json!({
+            "codexCustomModels": [{
+                "model": "DEEPSEEK-V4-PRO",
+                "providerId": "deepseek-provider"
+            }]
+        });
+        let resolve_provider =
+            |provider_id: &str| (provider_id == provider.id).then(|| provider.clone());
+
+        let entries = codex_custom_catalog_entries(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+            Some(&resolve_provider),
+        )
+        .expect("build aggregate catalog entries");
+
+        assert_eq!(entries[0].get("slug"), Some(&json!("DEEPSEEK-V4-PRO")));
+        assert_eq!(
+            entries[0].get("display_name"),
+            Some(&json!("DEEPSEEK-V4-PRO"))
+        );
+    }
+
+    #[test]
+    fn vendor_catalog_alias_selects_template_by_upstream_model() {
+        let vendor_models = vec![
+            json!({
+                "slug": "vendor-flash",
+                "display_name": "Vendor Flash",
+                "description": "Vendor Flash",
+                "vendor_capability": "flash"
+            }),
+            json!({
+                "slug": "vendor-pro",
+                "display_name": "Vendor Pro",
+                "description": "Vendor Pro",
+                "vendor_capability": "pro"
+            }),
+        ];
+        let spec = CodexCatalogModelSpec {
+            model: "gpt-5.2".to_string(),
+            display_name: None,
+            context_window: None,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+        };
+
+        let entry = codex_vendor_catalog_model_entry(&vendor_models, &spec, 0, Some("vendor-pro"));
+
+        assert_eq!(entry.get("slug"), Some(&json!("gpt-5.2")));
+        assert_eq!(entry.get("vendor_capability"), Some(&json!("pro")));
+    }
+
+    #[test]
+    fn aggregate_catalog_uses_bound_providers_default_context_window() {
+        let mut provider = Provider::with_id(
+            "native-provider".to_string(),
+            "Native Provider".to_string(),
+            json!({
+                "apiFormat": "openai_responses",
+                "model": "native-model",
+                "config": "model = \"native-model\"\nmodel_context_window = 262144\n"
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        let settings = json!({
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "native-provider",
+                "upstreamModel": "native-model"
+            }]
+        });
+        let resolve_provider =
+            |provider_id: &str| (provider_id == provider.id).then(|| provider.clone());
+
+        let entries = codex_custom_catalog_entries(
+            &settings,
+            "model_context_window = 999999\n",
+            CodexCatalogToolProfile::NativeResponses,
+            Some(&resolve_provider),
+        )
+        .expect("build aggregate catalog entries");
+
+        assert_eq!(entries[0].get("context_window"), Some(&json!(262_144)));
+        assert_eq!(entries[0].get("max_context_window"), Some(&json!(262_144)));
+    }
+
+    #[test]
+    fn aggregate_catalog_omits_mapping_when_bound_provider_is_missing() {
+        let settings = json!({
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deleted-provider",
+                "upstreamModel": "deepseek-v4-flash"
+            }]
+        });
+        let resolve_provider = |_: &str| -> Option<Provider> { None };
+
+        let entries = codex_custom_catalog_entries(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+            Some(&resolve_provider),
+        )
+        .expect("build aggregate catalog entries");
+
+        assert!(
+            entries.is_empty(),
+            "a stale mapping must not advertise an unroutable slot"
+        );
+    }
+
+    #[test]
+    fn aggregate_catalog_infers_modalities_from_the_actual_upstream_model() {
+        let db = crate::database::Database::memory().expect("create in-memory database");
+        let provider = Provider::with_id(
+            "deepseek-provider".to_string(),
+            "DeepSeek Provider".to_string(),
+            json!({
+                "apiFormat": "openai_responses",
+                "model": "deepseek-v4-flash",
+                "config": "model = \"deepseek-v4-flash\""
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider)
+            .expect("save bound provider");
+        let settings = json!({
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deepseek-provider",
+                "upstreamModel": "deepseek-v4-flash"
+            }]
+        });
+        let resolve_provider =
+            |provider_id: &str| resolve_codex_custom_catalog_provider_from_db(&db, provider_id);
+
+        let entries = codex_custom_catalog_entries(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+            Some(&resolve_provider),
+        )
+        .expect("build aggregate catalog entries");
+
+        assert_eq!(entries[0].get("slug"), Some(&json!("gpt-5.2")));
+        assert_eq!(
+            entries[0].get("input_modalities"),
+            Some(&json!(["text"])),
+            "capabilities must follow the routed upstream model, not the public slot"
+        );
+    }
+
+    #[test]
+    fn aggregate_catalog_infers_modalities_from_the_bound_providers_default_model() {
+        let db = crate::database::Database::memory().expect("create in-memory database");
+        let provider = Provider::with_id(
+            "deepseek-provider".to_string(),
+            "DeepSeek Provider".to_string(),
+            json!({
+                "apiFormat": "openai_responses",
+                "model": "deepseek-v4-flash",
+                "config": "model = \"deepseek-v4-flash\""
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider)
+            .expect("save bound provider");
+        let settings = json!({
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deepseek-provider"
+            }]
+        });
+        let resolve_provider =
+            |provider_id: &str| resolve_codex_custom_catalog_provider_from_db(&db, provider_id);
+
+        let entries = codex_custom_catalog_entries(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+            Some(&resolve_provider),
+        )
+        .expect("build aggregate catalog entries");
+
+        assert_eq!(
+            entries[0].get("input_modalities"),
+            Some(&json!(["text"])),
+            "an omitted upstream override must inherit the bound provider's routed model"
+        );
+    }
+
+    #[test]
+    fn aggregate_catalog_prefers_bound_provider_declared_modalities() {
+        let db = crate::database::Database::memory().expect("create in-memory database");
+        let provider = Provider::with_id(
+            "declared-provider".to_string(),
+            "Declared Provider".to_string(),
+            json!({
+                "apiFormat": "openai_responses",
+                "model": "custom-text-upstream",
+                "config": "model = \"custom-text-upstream\"",
+                "modelCatalog": {
+                    "models": [{
+                        "model": "custom-text-upstream",
+                        "inputModalities": ["text"]
+                    }]
+                }
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider)
+            .expect("save bound provider");
+        let settings = json!({
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "declared-provider",
+                "upstreamModel": "custom-text-upstream"
+            }]
+        });
+        let resolve_provider =
+            |provider_id: &str| resolve_codex_custom_catalog_provider_from_db(&db, provider_id);
+
+        let entries = codex_custom_catalog_entries(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+            Some(&resolve_provider),
+        )
+        .expect("build aggregate catalog entries");
+
+        assert_eq!(
+            entries[0].get("input_modalities"),
+            Some(&json!(["text"])),
+            "the bound provider's explicit capability declaration must win"
         );
     }
 
@@ -3509,6 +5164,7 @@ base_url = "https://production.api/v1"
             &settings,
             "",
             CodexCatalogToolProfile::NativeResponses,
+            None,
         )
         .expect("native catalog generation should not error")
         .expect("non-empty modelCatalog must yield a catalog");
@@ -3552,6 +5208,7 @@ wire_api = "responses"
             &settings,
             DEEPSEEK_NATIVE_CONFIG,
             CodexCatalogToolProfile::NativeResponses,
+            None,
         )
         .expect("vendor catalog generation should not error")
         .expect("non-empty modelCatalog must yield a catalog");
@@ -3641,6 +5298,7 @@ wire_api = "responses"
             &settings,
             DEEPSEEK_NATIVE_CONFIG,
             CodexCatalogToolProfile::NativeResponses,
+            None,
         )
         .expect("vendor catalog generation should not error")
         .expect("non-empty modelCatalog must yield a catalog");
@@ -3850,6 +5508,7 @@ web_search = "disabled"
             &settings,
             config,
             CodexCatalogToolProfile::Anthropic,
+            None,
         )
         .unwrap();
         let parsed: toml::Value = toml::from_str(&anthropic).unwrap();
@@ -3864,6 +5523,7 @@ web_search = "disabled"
             &settings,
             config,
             CodexCatalogToolProfile::ProxyChat,
+            None,
         )
         .unwrap();
         let parsed: toml::Value = toml::from_str(&proxy).unwrap();
@@ -4106,6 +5766,17 @@ web_search = "disabled"
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_cli_candidates_include_chatgpt_desktop_binary() {
+        assert!(
+            codex_cli_candidates().iter().any(|candidate| {
+                candidate == Path::new("/Applications/ChatGPT.app/Contents/Resources/codex")
+            }),
+            "fresh desktop-only installs need the bundled Codex version for cache validation"
+        );
+    }
+
     #[test]
     fn codex_bundled_models_command_uses_expected_program_and_args() {
         let command = codex_bundled_models_command(Path::new("codex"));
@@ -4241,6 +5912,1364 @@ web_search = "disabled"
                 "static template must contain key '{key}'"
             );
         }
+    }
+
+    #[test]
+    fn write_codex_models_cache_for_aggregate_refreshes_cache() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        // Pre-existing cache with a stale timestamp and an official model.
+        let stale_cache = json!({
+            "fetched_at": "2026-08-01T00:00:00.000000000Z",
+            "etag": "W/\"old\"",
+            "client_version": "0.146.0",
+            "models": [{
+                "slug": "gpt-5.5",
+                "display_name": "GPT-5.5",
+                "context_window": 400000
+            }]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&stale_cache).expect("serialize stale cache"),
+        )
+        .expect("write stale cache");
+
+        // Aggregate provider: official login disabled + custom model row.
+        let settings = json!({
+            "enableOfficialLogin": false,
+            "codexCustomModels": [{
+                "model": "deepseek-v4-flash",
+                "providerId": "deepseek",
+                "displayName": "DeepSeek V4 Flash",
+                "contextWindow": 131072
+            }]
+        });
+
+        write_codex_models_cache_for_aggregate_at(codex_dir.clone(), &settings, "", None)
+            .expect("aggregate cache write must succeed");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json"))
+                .expect("read refreshed cache"),
+        )
+        .expect("parse refreshed cache");
+
+        let fetched_at = written
+            .get("fetched_at")
+            .and_then(|v| v.as_str())
+            .expect("fetched_at must exist");
+        let parsed_fetched_at = chrono::DateTime::parse_from_rfc3339(fetched_at)
+            .expect("fetched_at must be valid RFC3339");
+        let age = chrono::Utc::now().signed_duration_since(parsed_fetched_at);
+        assert!(
+            age.num_seconds().abs() < 60,
+            "fetched_at must be fresh (age {age:?})"
+        );
+
+        let models = written
+            .get("models")
+            .and_then(|v| v.as_array())
+            .expect("models array");
+        let slugs: Vec<&str> = models
+            .iter()
+            .filter_map(|m| m.get("slug").and_then(|s| s.as_str()))
+            .collect();
+        assert!(
+            !slugs.contains(&"gpt-5.5"),
+            "stale official entries must be cleared in aggregate mode: {slugs:?}"
+        );
+        assert!(
+            slugs.contains(&"deepseek-v4-flash"),
+            "custom model must be present: {slugs:?}"
+        );
+        assert_eq!(slugs.len(), 1, "only the mapped custom model should remain");
+        assert!(
+            written
+                .get("etag")
+                .and_then(|value| value.as_str())
+                .is_some_and(|etag| etag.starts_with("W/\"cc-switch-")),
+            "aggregate rewrites must be marked as cc-switch-owned"
+        );
+    }
+
+    #[test]
+    fn models_cache_uses_detected_codex_version_when_cache_is_missing() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        write_models_cache_json_with_client_version(
+            &codex_dir,
+            vec![json!({ "slug": "gpt-5.2" })],
+            Some("codex-cli 0.147.3-alpha.2"),
+        )
+        .expect("write cache with detected Codex version");
+
+        let cache: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json"))
+                .expect("read models cache"),
+        )
+        .expect("parse models cache");
+        assert_eq!(
+            cache.get("client_version").and_then(Value::as_str),
+            Some("0.147.3")
+        );
+    }
+
+    #[test]
+    fn models_cache_prefers_detected_codex_version_after_upgrade() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_vec_pretty(&json!({
+                "client_version": "0.146.0",
+                "models": []
+            }))
+            .expect("serialize old cache"),
+        )
+        .expect("seed old cache");
+
+        write_models_cache_json_with_client_version(
+            &codex_dir,
+            vec![json!({ "slug": "gpt-5.2" })],
+            Some("codex-cli 0.147.0"),
+        )
+        .expect("rewrite cache for upgraded Codex");
+
+        let cache: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json"))
+                .expect("read models cache"),
+        )
+        .expect("parse models cache");
+        assert_eq!(
+            cache.get("client_version").and_then(Value::as_str),
+            Some("0.147.0")
+        );
+    }
+
+    #[test]
+    fn models_cache_refuses_to_invent_client_version() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let result = write_models_cache_json_with_client_version(
+            &codex_dir,
+            vec![json!({ "slug": "gpt-5.2" })],
+            None,
+        );
+
+        assert!(result.is_err(), "missing client version must fail closed");
+        assert!(
+            !codex_dir.join("models_cache.json").exists(),
+            "an unverifiable cache must not be published"
+        );
+    }
+
+    #[test]
+    fn codex_client_version_parser_rejects_malformed_output() {
+        assert_eq!(
+            parse_codex_cli_client_version("codex-cli 0.147.3-alpha.2"),
+            Some("0.147.3".to_string())
+        );
+        assert_eq!(parse_codex_cli_client_version("codex-cli dev"), None);
+        assert_eq!(parse_codex_cli_client_version("0.147"), None);
+        assert_eq!(parse_codex_cli_client_version(""), None);
+    }
+
+    #[test]
+    fn write_codex_models_cache_for_aggregate_builds_from_custom_mappings_only() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        // 旧缓存残留多个官方/旧供应商条目：聚合模式下不可路由，必须全部清掉，
+        // 只保留当前 codexCustomModels 映射的条目。
+        let stale_cache = json!({
+            "fetched_at": "2026-08-01T00:00:00.000000000Z",
+            "etag": "W/\"old\"",
+            "client_version": "0.146.0",
+            "models": [
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5"},
+                {"slug": "gpt-5.4", "display_name": "GPT-5.4"},
+                {"slug": "deepseek-v4-pro", "display_name": "DeepSeek V4 Pro"}
+            ]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&stale_cache).expect("serialize stale cache"),
+        )
+        .expect("write stale cache");
+
+        let settings = json!({
+            "enableOfficialLogin": false,
+            "codexCustomModels": [
+                {
+                    "model": "gpt-5.2",
+                    "providerId": "deepseek",
+                    "upstreamModel": "deepseek-v4-flash",
+                    "displayName": "DeepSeek V4 Flash",
+                    "contextWindow": 131072
+                },
+                {
+                    "model": "gpt-5.5",
+                    "providerId": "glm",
+                    "upstreamModel": "glm-5",
+                    "displayName": "GLM-5",
+                    "contextWindow": 131072
+                }
+            ]
+        });
+
+        write_codex_models_cache_for_aggregate_at(codex_dir.clone(), &settings, "", None)
+            .expect("aggregate cache write must succeed");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json"))
+                .expect("read refreshed cache"),
+        )
+        .expect("parse refreshed cache");
+        let models = written
+            .get("models")
+            .and_then(|v| v.as_array())
+            .expect("models array");
+        let slugs: Vec<&str> = models
+            .iter()
+            .filter_map(|m| m.get("slug").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            slugs,
+            vec!["gpt-5.2", "gpt-5.5"],
+            "only mapped carrier slots remain, stale official entries cleared"
+        );
+    }
+
+    #[test]
+    fn aggregate_rewrite_updates_existing_official_baseline_before_overwrite() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let old_baseline = json!({
+            "fetched_at": "2026-08-01T00:00:00Z",
+            "etag": "W/\"official-old\"",
+            "client_version": "0.146.0",
+            "cc_switch_captured_at": "2026-08-01T00:00:00Z",
+            "models": [{"slug": "gpt-5.4", "display_name": "GPT-5.4"}]
+        });
+        std::fs::write(
+            codex_dir.join("cc-switch-official-models-cache.json"),
+            serde_json::to_string(&old_baseline).expect("serialize old baseline"),
+        )
+        .expect("write old baseline");
+
+        let new_official = json!({
+            "fetched_at": "2026-08-04T00:00:00Z",
+            "etag": "W/\"official-new\"",
+            "client_version": "0.146.0",
+            "models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5"}]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&new_official).expect("serialize new official cache"),
+        )
+        .expect("write new official cache");
+
+        let settings = json!({
+            "enableOfficialLogin": false,
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deepseek",
+                "upstreamModel": "deepseek-v4-flash"
+            }]
+        });
+        write_codex_models_cache_for_aggregate_at(codex_dir.clone(), &settings, "", None)
+            .expect("write aggregate cache");
+
+        let baseline: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("cc-switch-official-models-cache.json"))
+                .expect("read updated baseline"),
+        )
+        .expect("parse updated baseline");
+        assert_eq!(
+            baseline.pointer("/models/0/slug").and_then(Value::as_str),
+            Some("gpt-5.5"),
+            "a clean official cache observed before aggregate rewrite must replace the old baseline"
+        );
+    }
+
+    #[test]
+    fn write_codex_models_cache_for_provider_rebuilds_for_regular_provider() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        // 残留缓存：既有官方模型，又有被覆盖成 DeepSeek 的条目。
+        let stale_cache = json!({
+            "fetched_at": "2026-08-01T00:00:00.000000000Z",
+            "etag": "W/\"old\"",
+            "client_version": "0.146.0",
+            "models": [
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5"},
+                {"slug": "gpt-5.2", "display_name": "DeepSeek V4 Flash"},
+                {"slug": "deepseek-v4-pro", "display_name": "DeepSeek V4 Pro"}
+            ]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&stale_cache).expect("serialize stale cache"),
+        )
+        .expect("write stale cache");
+
+        let provider = Provider {
+            id: "deepseek".to_string(),
+            name: "DeepSeek".to_string(),
+            settings_config: json!({
+                "modelCatalog": {
+                    "models": [
+                        {"model": "deepseek-v4-flash", "displayName": "DeepSeek V4 Flash", "contextWindow": 1048576},
+                        {"model": "deepseek-v4-pro", "displayName": "DeepSeek V4 Pro", "contextWindow": 1048576}
+                    ]
+                },
+                "config": "model_provider = \"custom\"\nmodel = \"deepseek-v4-flash\"\n[model_providers.custom]\nbase_url = \"https://api.deepseek.com\"\nwire_api = \"responses\"\n"
+            }),
+            website_url: None,
+            category: Some("codex".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(crate::provider::ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        write_codex_models_cache_for_provider_at(codex_dir.clone(), &provider, "", None)
+            .expect("rebuild must succeed");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json"))
+                .expect("read rebuilt cache"),
+        )
+        .expect("parse rebuilt cache");
+        let models = written
+            .get("models")
+            .and_then(|v| v.as_array())
+            .expect("models array");
+        let slugs: Vec<&str> = models
+            .iter()
+            .filter_map(|m| m.get("slug").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            slugs,
+            vec!["deepseek-v4-flash", "deepseek-v4-pro"],
+            "regular provider cache must contain only its own catalog"
+        );
+        assert!(
+            !slugs.contains(&"gpt-5.5"),
+            "stale official entries must be cleared"
+        );
+        assert!(
+            written
+                .get("etag")
+                .and_then(|value| value.as_str())
+                .is_some_and(|etag| etag.starts_with("W/\"cc-switch-")),
+            "regular-provider rewrites must be marked as cc-switch-owned"
+        );
+    }
+
+    #[test]
+    fn write_codex_models_cache_for_official_login_merges_custom_entries() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        // 缓存已有官方 gpt-5.5（官方登录拉取后 Codex 自行写入）。
+        let stale_cache = json!({
+            "fetched_at": "2026-08-01T00:00:00.000000000Z",
+            "etag": "W/\"old\"",
+            "client_version": "0.146.0",
+            "models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5"}]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&stale_cache).expect("serialize stale cache"),
+        )
+        .expect("write stale cache");
+        std::fs::write(
+            codex_dir.join("cc-switch-official-models-cache.json"),
+            serde_json::to_string(&stale_cache).expect("serialize trusted official baseline"),
+        )
+        .expect("write trusted official baseline");
+
+        // 官方登录 + 自定义模型：桌面端读 models_cache.json，需把自定义条目
+        // 合并进去，否则官方登录下看不到聚合模型。
+        let provider = Provider {
+            id: crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            name: "OpenAI Official".to_string(),
+            settings_config: json!({
+                "enableOfficialLogin": true,
+                "codexCustomModels": [{
+                    "model": "gpt-5.2",
+                    "providerId": "deepseek",
+                    "upstreamModel": "deepseek-v4-flash",
+                    "displayName": "DeepSeek V4 Flash"
+                }]
+            }),
+            website_url: None,
+            category: Some("official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        write_codex_models_cache_for_provider_at(codex_dir.clone(), &provider, "", None)
+            .expect("official-login aggregation write must succeed");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json")).expect("read cache"),
+        )
+        .expect("parse cache");
+        let models = written
+            .get("models")
+            .and_then(|v| v.as_array())
+            .expect("models array");
+        let slugs: Vec<&str> = models
+            .iter()
+            .filter_map(|m| m.get("slug").and_then(|s| s.as_str()))
+            .collect();
+        assert!(
+            slugs.contains(&"gpt-5.5"),
+            "official model must be preserved under official login: {slugs:?}"
+        );
+        assert!(
+            slugs.contains(&"gpt-5.2"),
+            "custom model must be merged into the desktop cache: {slugs:?}"
+        );
+        assert!(
+            written
+                .get("etag")
+                .and_then(|value| value.as_str())
+                .is_some_and(|etag| etag.starts_with("W/\"cc-switch-")),
+            "official-login aggregation must mark the rendered cache as cc-switch-owned"
+        );
+
+        let baseline: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("cc-switch-official-models-cache.json"))
+                .expect("read saved official baseline"),
+        )
+        .expect("parse saved official baseline");
+        let baseline_slugs: Vec<&str> = baseline
+            .get("models")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|model| model.get("slug").and_then(|slug| slug.as_str()))
+            .collect();
+        assert_eq!(
+            baseline_slugs,
+            vec!["gpt-5.5"],
+            "the sidecar must retain the clean official catalog without custom entries"
+        );
+
+        write_codex_models_cache_for_provider_at(codex_dir.clone(), &provider, "", None)
+            .expect("repeated official-login aggregation must reuse the saved baseline");
+        let repeated: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json"))
+                .expect("read repeated cache"),
+        )
+        .expect("parse repeated cache");
+        let repeated_slugs: Vec<&str> = repeated
+            .get("models")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|model| model.get("slug").and_then(|slug| slug.as_str()))
+            .collect();
+        assert!(repeated_slugs.contains(&"gpt-5.5"));
+        assert!(repeated_slugs.contains(&"gpt-5.2"));
+    }
+
+    #[test]
+    fn official_login_cache_omits_official_slot_with_missing_custom_provider() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+        let official_cache = json!({
+            "fetched_at": "2026-08-11T00:00:00Z",
+            "etag": "W/\"official\"",
+            "client_version": "0.147.0",
+            "models": [
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5"},
+                {"slug": "gpt-5.2", "display_name": "GPT-5.2"}
+            ]
+        });
+        for filename in [
+            "models_cache.json",
+            CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME,
+        ] {
+            std::fs::write(
+                codex_dir.join(filename),
+                serde_json::to_string(&official_cache).expect("serialize official cache"),
+            )
+            .expect("write official cache");
+        }
+        let settings = json!({
+            "enableOfficialLogin": true,
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deleted-provider",
+                "upstreamModel": "deepseek-v4-flash"
+            }]
+        });
+        let resolve_provider = |_: &str| -> Option<Provider> { None };
+
+        write_codex_models_cache_for_official_login_at(
+            codex_dir.clone(),
+            &settings,
+            "",
+            Some(&resolve_provider),
+        )
+        .expect("render official-login cache");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json")).expect("read cache"),
+        )
+        .expect("parse cache");
+        let slugs: Vec<&str> = written["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .filter_map(|model| model.get("slug").and_then(Value::as_str))
+            .collect();
+
+        assert_eq!(
+            slugs,
+            vec!["gpt-5.5"],
+            "a missing custom binding must also suppress its colliding official slot"
+        );
+        assert!(
+            written
+                .get("etag")
+                .and_then(Value::as_str)
+                .is_some_and(|etag| etag.starts_with("W/\"cc-switch-")),
+            "suppressing a colliding official row must mark the cache as rewritten"
+        );
+    }
+
+    #[test]
+    fn official_login_cache_preserves_clean_baseline_for_missing_noncolliding_provider() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+        let official_cache = json!({
+            "fetched_at": "2026-08-11T00:00:00Z",
+            "etag": "W/\"official\"",
+            "client_version": "0.147.0",
+            "models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5"}]
+        });
+        for filename in [
+            "models_cache.json",
+            CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME,
+        ] {
+            std::fs::write(
+                codex_dir.join(filename),
+                serde_json::to_string(&official_cache).expect("serialize official cache"),
+            )
+            .expect("write official cache");
+        }
+        let settings = json!({
+            "enableOfficialLogin": true,
+            "codexCustomModels": [{
+                "model": "custom-only-slot",
+                "providerId": "deleted-provider"
+            }]
+        });
+        let resolve_provider = |_: &str| -> Option<Provider> { None };
+
+        write_codex_models_cache_for_official_login_at(
+            codex_dir.clone(),
+            &settings,
+            "",
+            Some(&resolve_provider),
+        )
+        .expect("process official-login cache");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json")).expect("read cache"),
+        )
+        .expect("parse cache");
+        assert_eq!(
+            written, official_cache,
+            "a skipped noncolliding mapping must not rewrite a clean official cache"
+        );
+    }
+
+    #[test]
+    fn write_codex_models_cache_for_official_login_preserves_trusted_official_cache() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let stale_cache = json!({
+            "fetched_at": "2026-08-01T00:00:00.000000000Z",
+            "etag": "W/\"old\"",
+            "client_version": "0.146.0",
+            "models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5"}]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&stale_cache).expect("serialize stale cache"),
+        )
+        .expect("write stale cache");
+        std::fs::write(
+            codex_dir.join("cc-switch-official-models-cache.json"),
+            serde_json::to_string(&stale_cache).expect("serialize trusted official baseline"),
+        )
+        .expect("write trusted official baseline");
+
+        // 已建立可信 sidecar 时，官方登录且无自定义模型应保持纯官方缓存。
+        let provider = Provider {
+            id: crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            name: "OpenAI Official".to_string(),
+            settings_config: json!({
+                "enableOfficialLogin": true,
+            }),
+            website_url: None,
+            category: Some("official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        write_codex_models_cache_for_provider_at(codex_dir.clone(), &provider, "", None)
+            .expect("trusted official cache handling must not error");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json")).expect("read cache"),
+        )
+        .expect("parse cache");
+        assert_eq!(
+            written
+                .get("models")
+                .and_then(|v| v.as_array())
+                .map(|m| m.len()),
+            Some(1),
+            "trusted official cache must be preserved without custom models"
+        );
+    }
+
+    #[test]
+    fn official_login_without_custom_models_restores_saved_baseline() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let rendered_cache = json!({
+            "fetched_at": "2026-08-04T00:00:00Z",
+            "etag": "W/\"cc-switch-1754265600\"",
+            "client_version": "0.146.0",
+            "models": [{"slug": "deepseek-v4", "display_name": "DeepSeek V4"}]
+        });
+        let official_baseline = json!({
+            "fetched_at": "2026-08-03T00:00:00Z",
+            "etag": "W/\"official-clean\"",
+            "client_version": "0.146.0",
+            "models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5"}]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&rendered_cache).expect("serialize rendered cache"),
+        )
+        .expect("write rendered cache");
+        std::fs::write(
+            codex_dir.join("cc-switch-official-models-cache.json"),
+            serde_json::to_string(&official_baseline).expect("serialize official baseline"),
+        )
+        .expect("write official baseline");
+
+        let provider = Provider {
+            id: crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            name: "OpenAI Official".to_string(),
+            settings_config: json!({ "enableOfficialLogin": true }),
+            website_url: None,
+            category: Some("official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        write_codex_models_cache_for_provider_at(codex_dir.clone(), &provider, "", None)
+            .expect("restore official baseline");
+
+        let restored: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json"))
+                .expect("read restored cache"),
+        )
+        .expect("parse restored cache");
+        assert_eq!(
+            restored.pointer("/models/0/slug").and_then(Value::as_str),
+            Some("gpt-5.5"),
+            "switching back to plain official login must replace the fresh rendered cache"
+        );
+        assert_eq!(
+            restored.get("etag").and_then(Value::as_str),
+            Some("W/\"official-clean\"")
+        );
+    }
+
+    #[test]
+    fn write_codex_models_cache_for_provider_aggregate_delegates_to_merge() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let stale_cache = json!({
+            "fetched_at": "2026-08-01T00:00:00.000000000Z",
+            "etag": "W/\"old\"",
+            "client_version": "0.146.0",
+            "models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5"}]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&stale_cache).expect("serialize stale cache"),
+        )
+        .expect("write stale cache");
+
+        // 聚合模式（官方 + 关登录）：只保留映射到供应商的自定义模型，
+        // 旧缓存里的官方/残留条目全部清掉。
+        let provider = Provider {
+            id: crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            name: "OpenAI Official".to_string(),
+            settings_config: json!({
+                "enableOfficialLogin": false,
+                "codexCustomModels": [{
+                    "model": "deepseek-v4-flash",
+                    "providerId": "deepseek",
+                    "displayName": "DeepSeek V4 Flash",
+                    "contextWindow": 131072
+                }]
+            }),
+            website_url: None,
+            category: Some("official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        write_codex_models_cache_for_provider_at(codex_dir.clone(), &provider, "", None)
+            .expect("aggregate write must succeed");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json"))
+                .expect("read refreshed cache"),
+        )
+        .expect("parse refreshed cache");
+        let slugs: Vec<&str> = written
+            .get("models")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.get("slug").and_then(|s| s.as_str()))
+            .collect();
+        assert!(
+            !slugs.contains(&"gpt-5.5"),
+            "stale official entries must be cleared in aggregate mode: {slugs:?}"
+        );
+        assert!(
+            slugs.contains(&"deepseek-v4-flash"),
+            "custom model must be present in aggregate mode: {slugs:?}"
+        );
+    }
+
+    #[test]
+    fn write_codex_models_cache_for_official_login_clears_without_official_baseline() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        // 空缓存（models 为空数组）：没有可靠官方基线，删除以触发官方拉取。
+        let empty_cache = json!({
+            "fetched_at": "2026-08-01T00:00:00.000000000Z",
+            "etag": "W/\"old\"",
+            "client_version": "0.146.0",
+            "models": []
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&empty_cache).expect("serialize empty cache"),
+        )
+        .expect("write empty cache");
+
+        let settings = json!({
+            "enableOfficialLogin": true,
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deepseek",
+                "upstreamModel": "deepseek-v4-flash",
+                "displayName": "DeepSeek V4 Flash"
+            }]
+        });
+
+        write_codex_models_cache_for_official_login_at(codex_dir.clone(), &settings, "", None)
+            .expect("clear must not error");
+
+        assert!(
+            !codex_dir.join("models_cache.json").exists(),
+            "an unusable cache must be removed so Codex can fetch an official baseline"
+        );
+    }
+
+    #[test]
+    fn write_codex_models_cache_for_official_login_removes_aggregate_leftover_cache() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        // 缓存是聚合模式（关闭官方登录）写的：etag 是 cc-switch 生成的，
+        // 里面的条目不是官方基线，删除缓存让 Codex 立即拉官方模型。
+        let aggregate_cache = json!({
+            "fetched_at": "2026-08-01T00:00:00.000000000Z",
+            "etag": "W/\"cc-switch-1754000000\"",
+            "client_version": "0.146.0",
+            "models": [{"slug": "gpt-5.2", "display_name": "DeepSeek V4 Flash"}]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&aggregate_cache).expect("serialize aggregate cache"),
+        )
+        .expect("write aggregate cache");
+
+        let settings = json!({
+            "enableOfficialLogin": true,
+            "codexCustomModels": [{
+                "model": "gpt-5.5",
+                "providerId": "glm",
+                "upstreamModel": "glm-5",
+                "displayName": "GLM-5"
+            }]
+        });
+
+        write_codex_models_cache_for_official_login_at(codex_dir.clone(), &settings, "", None)
+            .expect("clear must not error");
+
+        assert!(
+            !codex_dir.join("models_cache.json").exists(),
+            "a fresh aggregate cache must be removed so official login refetches immediately"
+        );
+    }
+
+    #[test]
+    fn official_login_quarantines_unmarked_legacy_cache_until_official_refetch() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let legacy_rendered = json!({
+            "fetched_at": "2026-08-03T17:00:00Z",
+            "etag": "W/\"official-etag-preserved-by-legacy-cc-switch\"",
+            "client_version": "0.146.0",
+            "models": [
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5"},
+                {"slug": "gpt-5.2", "display_name": "DeepSeek V4 Flash"}
+            ]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&legacy_rendered).expect("serialize legacy cache"),
+        )
+        .expect("write legacy cache");
+
+        let settings = json!({
+            "enableOfficialLogin": true,
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deepseek",
+                "upstreamModel": "deepseek-v4-flash",
+                "displayName": "DeepSeek V4 Flash"
+            }]
+        });
+        write_codex_models_cache_for_official_login_at(codex_dir.clone(), &settings, "", None)
+            .expect("quarantine legacy cache");
+        assert!(
+            !codex_dir.join("models_cache.json").exists(),
+            "an unmarked pre-sidecar cache must be removed so Codex fetches a clean official catalog"
+        );
+
+        let refetched_official = json!({
+            "fetched_at": "2026-08-04T01:00:00Z",
+            "etag": "W/\"official-refetched\"",
+            "client_version": "0.146.0",
+            "models": [
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5"},
+                {"slug": "gpt-5.2", "display_name": "GPT-5.2"}
+            ]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&refetched_official).expect("serialize refetched cache"),
+        )
+        .expect("write refetched cache");
+        write_codex_models_cache_for_official_login_at(codex_dir.clone(), &settings, "", None)
+            .expect("merge after official refetch");
+
+        let baseline: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("cc-switch-official-models-cache.json"))
+                .expect("read clean baseline"),
+        )
+        .expect("parse clean baseline");
+        assert_eq!(
+            baseline
+                .pointer("/models/1/display_name")
+                .and_then(Value::as_str),
+            Some("GPT-5.2"),
+            "the clean sidecar must come from the refetched official catalog"
+        );
+        let rendered: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json"))
+                .expect("read rendered cache"),
+        )
+        .expect("parse rendered cache");
+        assert_eq!(
+            rendered
+                .pointer("/models/1/display_name")
+                .and_then(Value::as_str),
+            Some("DeepSeek V4 Flash"),
+            "the rendered cache must still apply the current custom mapping"
+        );
+    }
+
+    #[test]
+    fn official_login_does_not_capture_proxy_merged_catalog_as_baseline() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let clean_baseline = json!({
+            "fetched_at": "2026-08-08T00:00:00Z",
+            "etag": "W/\"official-old\"",
+            "client_version": "0.147.0",
+            "cc_switch_captured_at": chrono::Utc::now().to_rfc3339(),
+            "models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5"}]
+        });
+        let proxy_merged_catalog = json!({
+            "fetched_at": "2026-08-09T00:00:00Z",
+            "etag": "W/\"official-new\"",
+            "client_version": "0.147.0",
+            "cc_switch_merged": true,
+            "models": [
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5"},
+                {"slug": "gpt-5.2", "display_name": "DeepSeek V4 Flash"}
+            ]
+        });
+        std::fs::write(
+            codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME),
+            serde_json::to_string(&clean_baseline).expect("serialize clean baseline"),
+        )
+        .expect("write clean baseline");
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&proxy_merged_catalog).expect("serialize proxy catalog"),
+        )
+        .expect("write proxy catalog");
+
+        let settings = json!({
+            "enableOfficialLogin": true,
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deepseek",
+                "upstreamModel": "deepseek-v4-flash",
+                "displayName": "DeepSeek V4 Flash"
+            }]
+        });
+        write_codex_models_cache_for_official_login_at(codex_dir.clone(), &settings, "", None)
+            .expect("render official-login cache");
+
+        let baseline: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME),
+            )
+            .expect("read official baseline"),
+        )
+        .expect("parse official baseline");
+        let baseline_slugs: Vec<&str> = baseline
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|model| model.get("slug").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            baseline_slugs,
+            vec!["gpt-5.5"],
+            "a proxy-merged catalog must never become the official baseline"
+        );
+    }
+
+    #[test]
+    fn forwarded_official_catalog_replaces_awaiting_baseline_before_merge() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+        std::fs::write(
+            codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME),
+            serde_json::to_string(&json!({
+                "cc_switch_state": "awaiting_official_refresh"
+            }))
+            .expect("serialize awaiting baseline"),
+        )
+        .expect("write awaiting baseline");
+
+        let clean_catalog = json!({
+            "models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5"}]
+        });
+        capture_forwarded_codex_official_models_baseline_at(
+            &codex_dir,
+            &clean_catalog,
+            "0.147.0",
+            Some("W/\"official-catalog\""),
+        )
+        .expect("capture clean forwarded catalog");
+
+        let baseline: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME),
+            )
+            .expect("read captured baseline"),
+        )
+        .expect("parse captured baseline");
+        assert_eq!(baseline["models"], clean_catalog["models"]);
+        assert_eq!(baseline["client_version"], "0.147.0");
+        assert_eq!(baseline["etag"], "W/\"official-catalog\"");
+        assert!(baseline.get("fetched_at").and_then(Value::as_str).is_some());
+        assert!(baseline
+            .get(CODEX_OFFICIAL_BASELINE_CAPTURED_AT_KEY)
+            .and_then(Value::as_str)
+            .is_some());
+        assert!(baseline.get(CODEX_OFFICIAL_MODELS_MERGED_KEY).is_none());
+        assert!(baseline.get(CODEX_OFFICIAL_BASELINE_STATE_KEY).is_none());
+    }
+
+    #[test]
+    fn forwarded_merged_catalog_cannot_replace_the_official_baseline() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+        let awaiting = json!({
+            "cc_switch_state": "awaiting_official_refresh"
+        });
+        std::fs::write(
+            codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME),
+            serde_json::to_string(&awaiting).expect("serialize awaiting baseline"),
+        )
+        .expect("write awaiting baseline");
+
+        let captured = capture_forwarded_codex_official_models_baseline_at(
+            &codex_dir,
+            &json!({
+                "cc_switch_merged": true,
+                "models": [{"slug": "custom-slot"}]
+            }),
+            "0.147.0",
+            Some("W/\"cc-switch-merged\""),
+        )
+        .expect("reject merged catalog without an IO error");
+
+        assert!(!captured);
+        let saved: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME),
+            )
+            .expect("read unchanged baseline"),
+        )
+        .expect("parse unchanged baseline");
+        assert_eq!(saved, awaiting);
+    }
+
+    #[test]
+    fn forwarded_catalog_with_cc_switch_body_etag_cannot_be_laundered() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+
+        let captured = capture_forwarded_codex_official_models_baseline_at(
+            &codex_dir,
+            &json!({
+                "etag": "W/\"cc-switch-merged-1\"",
+                "models": [{"slug": "custom-slot"}]
+            }),
+            "0.147.0",
+            Some("W/\"official-http-etag\""),
+        )
+        .expect("reject cc-switch body ETag without an IO error");
+
+        assert!(!captured);
+        assert!(!codex_dir
+            .join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME)
+            .exists());
+    }
+
+    #[test]
+    fn official_login_expires_saved_baseline_instead_of_refreshing_it_forever() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let rendered_cache = json!({
+            "fetched_at": chrono::Utc::now().to_rfc3339(),
+            "etag": "W/\"cc-switch-recent\"",
+            "client_version": "0.146.0",
+            "models": [{"slug": "gpt-5.5"}, {"slug": "gpt-5.2"}]
+        });
+        let expired_baseline = json!({
+            "fetched_at": "2026-08-01T00:00:00Z",
+            "etag": "W/\"official-old\"",
+            "client_version": "0.146.0",
+            "cc_switch_captured_at": "2026-08-01T00:00:00Z",
+            "models": [{"slug": "gpt-5.5"}]
+        });
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&rendered_cache).expect("serialize rendered cache"),
+        )
+        .expect("write rendered cache");
+        std::fs::write(
+            codex_dir.join("cc-switch-official-models-cache.json"),
+            serde_json::to_string(&expired_baseline).expect("serialize expired baseline"),
+        )
+        .expect("write expired baseline");
+
+        let settings = json!({
+            "enableOfficialLogin": true,
+            "codexCustomModels": [{
+                "model": "gpt-5.2",
+                "providerId": "deepseek",
+                "upstreamModel": "deepseek-v4-flash"
+            }]
+        });
+        write_codex_models_cache_for_official_login_at(codex_dir.clone(), &settings, "", None)
+            .expect("expire official baseline");
+
+        assert!(
+            !codex_dir.join("models_cache.json").exists(),
+            "an expired clean baseline must remove the fresh rendered cache so Codex refetches"
+        );
+        let sidecar: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("cc-switch-official-models-cache.json"))
+                .expect("read awaiting sidecar"),
+        )
+        .expect("parse awaiting sidecar");
+        assert_eq!(
+            sidecar.get("cc_switch_state").and_then(Value::as_str),
+            Some("awaiting_official_refresh"),
+            "the expired baseline must not be reused by the next 240-second refresh"
+        );
+    }
+
+    #[test]
+    fn repeated_same_official_snapshot_does_not_extend_baseline_ttl() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let official_live = json!({
+            "fetched_at": "2026-08-01T00:00:00Z",
+            "etag": "W/\"official-unchanged\"",
+            "client_version": "0.146.0",
+            "models": [{"slug": "gpt-5.5"}]
+        });
+        let mut expired_sidecar = official_live.clone();
+        expired_sidecar
+            .as_object_mut()
+            .expect("sidecar object")
+            .insert(
+                "cc_switch_captured_at".to_string(),
+                Value::String("2026-08-01T00:00:00Z".to_string()),
+            );
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_string(&official_live).expect("serialize official live cache"),
+        )
+        .expect("write official live cache");
+        std::fs::write(
+            codex_dir.join("cc-switch-official-models-cache.json"),
+            serde_json::to_string(&expired_sidecar).expect("serialize expired sidecar"),
+        )
+        .expect("write expired sidecar");
+
+        restore_or_clear_codex_official_models_cache(&codex_dir)
+            .expect("expire unchanged official snapshot");
+
+        assert!(
+            !codex_dir.join("models_cache.json").exists(),
+            "re-observing the same official fingerprint must not reset its capture time"
+        );
+    }
+
+    #[test]
+    fn invalid_official_baseline_capture_time_forces_refetch() {
+        for (case, captured_at) in [
+            ("malformed", "not-a-timestamp"),
+            ("far-future", "2099-01-01T00:00:00Z"),
+        ] {
+            let temp_home = tempfile::tempdir().expect("create temp home");
+            let codex_dir = temp_home.path().join(".codex");
+            std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+            let rendered_cache = json!({
+                "fetched_at": chrono::Utc::now().to_rfc3339(),
+                "etag": "W/\"cc-switch-recent\"",
+                "models": [{"slug": "gpt-5.5"}]
+            });
+            let sidecar = json!({
+                "fetched_at": "2026-08-04T00:00:00Z",
+                "etag": "W/\"official-stale\"",
+                "cc_switch_captured_at": captured_at,
+                "models": [{"slug": "gpt-5.5"}]
+            });
+            std::fs::write(
+                codex_dir.join("models_cache.json"),
+                serde_json::to_string(&rendered_cache).expect("serialize rendered cache"),
+            )
+            .expect("write rendered cache");
+            std::fs::write(
+                codex_dir.join("cc-switch-official-models-cache.json"),
+                serde_json::to_string(&sidecar).expect("serialize sidecar"),
+            )
+            .expect("write sidecar");
+
+            restore_or_clear_codex_official_models_cache(&codex_dir)
+                .expect("handle invalid capture time");
+
+            assert!(
+                !codex_dir.join("models_cache.json").exists(),
+                "{case} capture time must quarantine the sidecar and force an official refetch"
+            );
+        }
+    }
+
+    #[test]
+    fn official_baseline_capture_state_has_exact_ttl_boundaries() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-04T12:00:00Z")
+            .expect("parse fixed now")
+            .with_timezone(&chrono::Utc);
+        let state_for = |captured_at: Value| {
+            codex_official_baseline_capture_state(
+                &json!({ "cc_switch_captured_at": captured_at }),
+                now,
+            )
+        };
+
+        assert_eq!(
+            codex_official_baseline_capture_state(&json!({}), now),
+            CodexOfficialBaselineCaptureState::Missing
+        );
+        assert_eq!(
+            state_for(json!("2026-08-04T11:55:01Z")),
+            CodexOfficialBaselineCaptureState::Fresh,
+            "299 seconds must remain fresh"
+        );
+        assert_eq!(
+            state_for(json!("2026-08-04T11:55:00Z")),
+            CodexOfficialBaselineCaptureState::Expired,
+            "300 seconds is the exact expiry boundary"
+        );
+        assert_eq!(
+            state_for(json!("2026-08-04T11:54:59Z")),
+            CodexOfficialBaselineCaptureState::Expired,
+            "301 seconds must be expired"
+        );
+        assert_eq!(
+            state_for(json!("not-a-timestamp")),
+            CodexOfficialBaselineCaptureState::Invalid
+        );
+        assert_eq!(
+            state_for(json!(42)),
+            CodexOfficialBaselineCaptureState::Invalid
+        );
+        assert_eq!(
+            state_for(json!("2026-08-04T12:01:01Z")),
+            CodexOfficialBaselineCaptureState::Invalid,
+            "capture times beyond the clock-skew allowance must be quarantined"
+        );
+    }
+
+    #[test]
+    fn write_codex_models_cache_derives_single_entry_from_top_level_model() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+        std::fs::write(
+            codex_dir.join("models_cache.json"),
+            serde_json::to_vec_pretty(&json!({
+                "client_version": "0.146.0",
+                "models": []
+            }))
+            .expect("serialize cache version fixture"),
+        )
+        .expect("seed cache version fixture");
+
+        // 供应商只有顶层 model、没有 modelCatalog：从配置的 model 派生单条缓存，
+        // 桌面端至少能发现默认模型，而不是写入空列表。
+        let config_text = "model_provider = \"custom\"\nmodel = \"deepseek-v4-flash\"\n[model_providers.custom]\nbase_url = \"https://api.deepseek.com\"\nwire_api = \"responses\"\n";
+        let provider = Provider {
+            id: "deepseek".to_string(),
+            name: "DeepSeek".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("codex".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(crate::provider::ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        write_codex_models_cache_for_provider_at(codex_dir.clone(), &provider, config_text, None)
+            .expect("write must succeed");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json")).expect("read cache"),
+        )
+        .expect("parse cache");
+        let models = written
+            .get("models")
+            .and_then(|v| v.as_array())
+            .expect("models array");
+        assert_eq!(models.len(), 1, "single entry derived from top-level model");
+        assert_eq!(
+            models[0].get("slug").and_then(|v| v.as_str()),
+            Some("deepseek-v4-flash"),
+            "derived entry carries the configured model slug"
+        );
     }
 
     #[test]
@@ -4457,6 +7486,89 @@ model_catalog_json = "cc-switch-model-catalog.json"
         assert!(
             result.is_err(),
             "file larger than MAX_CODEX_CATALOG_BYTES must be rejected"
+        );
+    }
+
+    #[test]
+    fn custom_model_entries_parse_and_dedupe() {
+        let settings = json!({
+            "codexCustomModels": [
+                {
+                    "model": "my-deepseek",
+                    "providerId": "prov-1",
+                    "upstreamModel": "deepseek-chat",
+                    "displayName": "DeepSeek via cc-switch",
+                    "contextWindow": 128000,
+                    "inputModalities": ["text"]
+                },
+                {
+                    "model": "my-deepseek",
+                    "providerId": "prov-2"
+                },
+                {
+                    "model": "  ",
+                    "providerId": "prov-3"
+                },
+                {
+                    "model": "snake-case",
+                    "provider_id": "prov-4",
+                    "upstream_model": "deepseek-reasoner"
+                },
+                {
+                    "model": "my-deepseek[1M]",
+                    "providerId": "prov-5"
+                }
+            ]
+        });
+        let entries = codex_custom_model_entries(&settings);
+        assert_eq!(
+            entries.len(),
+            2,
+            "duplicate (including [1M]-suffixed) and empty model ids are skipped"
+        );
+        assert_eq!(entries[0].model, "my-deepseek");
+        assert_eq!(entries[0].provider_id, "prov-1");
+        assert_eq!(entries[0].upstream_model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(entries[0].context_window, Some(128_000));
+        assert_eq!(
+            entries[0].input_modalities.as_deref(),
+            Some(&["text".to_string()][..])
+        );
+        assert_eq!(entries[1].model, "snake-case");
+        assert_eq!(entries[1].provider_id, "prov-4");
+        assert_eq!(
+            entries[1].upstream_model.as_deref(),
+            Some("deepseek-reasoner")
+        );
+    }
+
+    #[test]
+    fn custom_model_entries_parse_route_chain() {
+        let settings = json!({
+            "codexCustomModels": [
+                {
+                    "model": "gpt-5.2",
+                    "routes": [
+                        { "providerId": "p1", "upstreamModel": "model-a" },
+                        { "provider_id": "p2", "upstream_model": "model-b" }
+                    ]
+                }
+            ]
+        });
+        let entries = codex_custom_model_entries(&settings);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provider_id, "p1");
+        assert_eq!(entries[0].upstream_model.as_deref(), Some("model-a"));
+        assert_eq!(entries[0].routes.len(), 2);
+        assert_eq!(entries[0].routes[0].provider_id, "p1");
+        assert_eq!(
+            entries[0].routes[0].upstream_model.as_deref(),
+            Some("model-a")
+        );
+        assert_eq!(entries[0].routes[1].provider_id, "p2");
+        assert_eq!(
+            entries[0].routes[1].upstream_model.as_deref(),
+            Some("model-b")
         );
     }
 }

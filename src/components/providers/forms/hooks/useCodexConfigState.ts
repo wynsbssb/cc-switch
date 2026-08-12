@@ -8,7 +8,11 @@ import {
   updateCodexExperimentalBearerToken,
 } from "@/utils/providerConfigUtils";
 import { normalizeTomlText } from "@/utils/textNormalization";
-import type { CodexCatalogModel } from "@/types";
+import type {
+  CodexCatalogModel,
+  CodexCustomModel,
+  CodexCustomModelRoute,
+} from "@/types";
 
 interface UseCodexConfigStateProps {
   initialData?: {
@@ -42,6 +46,12 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
   const [codexCatalogModels, setCodexCatalogModels] = useState<
     CodexCatalogModel[]
   >([]);
+  const [codexCustomModels, setCodexCustomModels] = useState<
+    CodexCustomModel[]
+  >([]);
+  const [codexEnableOfficialLogin, setCodexEnableOfficialLogin] =
+    useState(true);
+  const [codexAggregationEnabled, setCodexAggregationEnabled] = useState(true);
   const [codexAuthError, setCodexAuthError] = useState("");
 
   const isUpdatingCodexBaseUrlRef = useRef(false);
@@ -118,7 +128,146 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
           .filter((item: CodexCatalogModel) => item.model.trim()),
       );
 
-      // 提取 Base URL
+      // 官方 Codex 供应商的自定义模型（对外 ID -> 绑定供应商）
+      const rawCustomModels = Array.isArray((config as any).codexCustomModels)
+        ? (config as any).codexCustomModels
+        : [];
+      setCodexCustomModels(
+        rawCustomModels
+          .map((item: any) => {
+            const supportsParallelToolCalls =
+              typeof item?.supportsParallelToolCalls === "boolean"
+                ? item.supportsParallelToolCalls
+                : typeof item?.supports_parallel_tool_calls === "boolean"
+                  ? item.supports_parallel_tool_calls
+                  : undefined;
+            const inputModalities = Array.isArray(item?.inputModalities)
+              ? item.inputModalities
+              : Array.isArray(item?.input_modalities)
+                ? item.input_modalities
+                : undefined;
+            const baseInstructions =
+              typeof item?.baseInstructions === "string"
+                ? item.baseInstructions
+                : typeof item?.base_instructions === "string"
+                  ? item.base_instructions
+                  : undefined;
+
+            const legacyProviderId =
+              typeof item?.providerId === "string"
+                ? item.providerId.trim()
+                : typeof item?.provider_id === "string"
+                  ? item.provider_id.trim()
+                  : "";
+            const legacyUpstream =
+              typeof item?.upstreamModel === "string"
+                ? item.upstreamModel.trim()
+                : typeof item?.upstream_model === "string"
+                  ? item.upstream_model.trim()
+                  : "";
+
+            const rawRoutes = Array.isArray(item?.routes) ? item.routes : [];
+            let routes: CodexCustomModelRoute[] = rawRoutes
+              .map((route: any) => {
+                const providerId =
+                  typeof route?.providerId === "string"
+                    ? route.providerId.trim()
+                    : typeof route?.provider_id === "string"
+                      ? route.provider_id.trim()
+                      : "";
+                if (!providerId) return null;
+                const upstreamModel =
+                  typeof route?.upstreamModel === "string"
+                    ? route.upstreamModel.trim()
+                    : typeof route?.upstream_model === "string"
+                      ? route.upstream_model.trim()
+                      : "";
+                return {
+                  providerId,
+                  ...(upstreamModel ? { upstreamModel } : {}),
+                } as CodexCustomModelRoute;
+              })
+              .filter(
+                (
+                  route: CodexCustomModelRoute | null,
+                ): route is CodexCustomModelRoute => route !== null,
+              );
+
+            if (routes.length === 0 && legacyProviderId) {
+              routes = [
+                {
+                  providerId: legacyProviderId,
+                  ...(legacyUpstream ? { upstreamModel: legacyUpstream } : {}),
+                },
+              ];
+            }
+
+            const primaryRoute = routes[0];
+            return {
+              model: typeof item?.model === "string" ? item.model : "",
+              providerId: primaryRoute?.providerId ?? legacyProviderId,
+              upstreamModel:
+                primaryRoute?.upstreamModel ?? (legacyUpstream || undefined),
+              routes,
+              displayName:
+                typeof item?.displayName === "string"
+                  ? item.displayName
+                  : typeof item?.display_name === "string"
+                    ? item.display_name
+                    : "",
+              contextWindow:
+                typeof item?.contextWindow === "string" ||
+                typeof item?.contextWindow === "number"
+                  ? item.contextWindow
+                  : typeof item?.context_window === "string" ||
+                      typeof item?.context_window === "number"
+                    ? item.context_window
+                    : "",
+              ...(supportsParallelToolCalls !== undefined
+                ? { supportsParallelToolCalls }
+                : {}),
+              ...(inputModalities ? { inputModalities } : {}),
+              ...(baseInstructions ? { baseInstructions } : {}),
+            };
+          })
+          .filter(
+            (item: CodexCustomModel) =>
+              item.model.trim() && (item.routes ?? []).length > 0,
+          ),
+      );
+
+      setCodexEnableOfficialLogin(
+        typeof (config as any).enableOfficialLogin === "boolean"
+          ? (config as any).enableOfficialLogin
+          : true,
+      );
+
+      // 模型聚合总开关：显式设置优先；未设置时按"有自定义模型或关闭官方登录"推导，
+      // 保证已有聚合配置的供应商在 UI 上仍展开聚合区。
+      const aggSetting = (config as any).codexAggregationEnabled;
+      const effectiveLogin =
+        typeof (config as any).enableOfficialLogin === "boolean"
+          ? (config as any).enableOfficialLogin
+          : true;
+      setCodexAggregationEnabled(
+        typeof aggSetting === "boolean"
+          ? aggSetting
+          : rawCustomModels.some((item: any) => {
+              const hasModel =
+                typeof item?.model === "string" && item.model.trim();
+              const hasRoute =
+                Array.isArray(item?.routes) &&
+                item.routes.some(
+                  (route: any) =>
+                    typeof route?.providerId === "string" &&
+                    route.providerId.trim(),
+                );
+              const hasLegacy =
+                typeof item?.providerId === "string" && item.providerId.trim();
+              return hasModel && (hasRoute || hasLegacy);
+            }) || !effectiveLogin,
+      );
+
       const initialBaseUrl = extractCodexBaseUrl(configStr);
       if (initialBaseUrl) {
         setCodexBaseUrl(initialBaseUrl);
@@ -278,18 +427,33 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
       auth: Record<string, unknown>,
       config: string,
       modelCatalogModels: CodexCatalogModel[] = [],
+      customModels: CodexCustomModel[] = [],
+      enableOfficialLogin: boolean = true,
+      aggregationEnabled?: boolean,
     ) => {
       const authString = JSON.stringify(auth, null, 2);
       setCodexAuth(authString);
       setCodexConfig(config);
       setCodexCatalogModels(modelCatalogModels);
+      setCodexCustomModels(customModels);
+      setCodexEnableOfficialLogin(enableOfficialLogin);
+      setCodexAggregationEnabled(
+        aggregationEnabled ?? (customModels.length > 0 || !enableOfficialLogin),
+      );
 
       const baseUrl = extractCodexBaseUrl(config);
       setCodexBaseUrl(baseUrl || "");
 
       setCodexApiKey(pickCodexApiKey(auth, config));
     },
-    [setCodexAuth, setCodexConfig, setCodexCatalogModels],
+    [
+      setCodexAuth,
+      setCodexConfig,
+      setCodexCatalogModels,
+      setCodexCustomModels,
+      setCodexEnableOfficialLogin,
+      setCodexAggregationEnabled,
+    ],
   );
 
   return {
@@ -299,10 +463,16 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
     codexBaseUrl,
     codexModel,
     codexCatalogModels,
+    codexCustomModels,
+    codexEnableOfficialLogin,
+    codexAggregationEnabled,
     codexAuthError,
     setCodexAuth,
     setCodexConfig,
     setCodexCatalogModels,
+    setCodexCustomModels,
+    setCodexEnableOfficialLogin,
+    setCodexAggregationEnabled,
     handleCodexApiKeyChange,
     handleCodexBaseUrlChange,
     handleCodexModelChange,
