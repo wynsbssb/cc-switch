@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 
 - **Codex Desktop Conversation Snapshots Are Now Incremental — No More Rewriting Hundreds of MB per Switch/Exit**: Snapshots previously copied every session, archive and index file from scratch each time, so each provider switch, startup or exit rewrote the full conversation dataset (hundreds of MB in real installs) even when only a few files had changed. Snapshots now hard-link files that are unchanged since the last snapshot (same volume, zero data written) and only write new or modified files plus the small state database, cutting per-trigger writes from hundreds of MB to the actual delta. The exit-time snapshot also runs under a 2-second deadline so quitting is never held hostage by a slow copy, staging directories are written atomically and cleaned up afterwards, and the SQLite state backup no longer sleeps 250ms every 5 pages (~4s of pure waiting for a 1.25MB DB). Backup/restore coverage is unchanged.
+- **Codex 官方登录聚合列表为官方模型加「官方-」前缀**: 官方登录开启且配置了模型聚合时，渲染到模型列表（桌面端 / CLI）的官方模型显示名会带上 `官方-` 前缀（例如 `官方-gpt-5.6-sol`），与路由到其他供应商的自定义模型一目了然地分开；保存的官方基线保持原样，切回非聚合模式后不再带前缀。
 
 ## [3.19.2] - 2026-08-06
 

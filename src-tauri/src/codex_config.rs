@@ -39,6 +39,9 @@ pub(crate) const CODEX_CUSTOM_MODELS_KEY: &str = "codexCustomModels";
 /// 官方 Codex 供应商「启用官方登录」开关。关闭时进入聚合模式：
 /// 不要求 ChatGPT 登录，模型列表来自下方配置的多个供应商，按模型路由。
 pub(crate) const CODEX_OFFICIAL_LOGIN_KEY: &str = "enableOfficialLogin";
+/// 官方登录聚合模式下，给官方模型的菜单显示名加的前缀，用于和路由到其他
+/// 供应商的自定义模型区分（例如 `官方-gpt-5.6-sol`）。
+pub(crate) const CODEX_OFFICIAL_MODEL_DISPLAY_PREFIX: &str = "官方-";
 const CODEX_PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
 #[cfg(target_os = "windows")]
@@ -1382,10 +1385,57 @@ fn write_codex_models_cache_for_aggregate_at(
 /// 不可见。合并保留缓存中已有的官方模型条目（官方登录下可路由），再追加/
 /// 覆盖当前配置的自定义条目（同名时自定义优先）。
 ///
+/// 官方登录聚合模式下，给官方模型的菜单显示名加「官方-」前缀，与路由到
+/// 其他供应商的自定义模型区分（例如 `官方-gpt-5.6-sol`）。
+/// 
+/// 只改写渲染用的缓存副本，不触碰保存的官方基线；已带前缀的条目保持
+/// 原样（幂等），没有显示名的条目回退到前缀 + slug。
+pub(crate) fn apply_codex_official_model_display_prefix(models: &mut [Value]) {
+    let prefix = CODEX_OFFICIAL_MODEL_DISPLAY_PREFIX;
+    for model in models.iter_mut() {
+        let Some(object) = model.as_object_mut() else {
+            continue;
+        };
+        let slug = object
+            .get("slug")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|slug| !slug.is_empty())
+            .map(str::to_string);
+        let mut prefixed_any = false;
+        for key in ["display_name", "displayName"] {
+            let Some(name) = object.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() || name.starts_with(prefix) {
+                continue;
+            }
+            object.insert(key.to_string(), Value::String(format!("{prefix}{name}")));
+            prefixed_any = true;
+        }
+        if !prefixed_any {
+            if let Some(slug) = slug {
+                let prefixed = format!("{prefix}{slug}");
+                if !object.contains_key("display_name") {
+                    object.insert("display_name".to_string(), Value::String(prefixed.clone()));
+                }
+                if !object.contains_key("displayName") {
+                    object.insert("displayName".to_string(), Value::String(prefixed));
+                }
+            }
+        }
+    }
+}
+
 /// 仅在现有缓存里有可靠官方基线时写入：缓存缺失/为空/还是聚合模式写的
 /// （cc-switch 生成的 etag）时删除 live 缓存，让 Codex 桌面端立即拉官方模型。
 /// 否则把一个没有官方模型的缓存标成 fresh（300s TTL），会阻断桌面端恢复
 /// 真实官方目录，自定义模型也会一直排挤掉官方模型。
+/// 
+/// 渲染出的官方模型条目显示名会带上
+/// [`CODEX_OFFICIAL_MODEL_DISPLAY_PREFIX`]（例如 `官方-gpt-5.6-sol`），
+/// 与路由到其他供应商的自定义模型区分；保存的官方基线保持原样。
 fn write_codex_models_cache_for_official_login_at(
     codex_dir: PathBuf,
     settings: &Value,
@@ -1407,6 +1457,7 @@ fn write_codex_models_cache_for_official_login_at(
         .and_then(|models| models.as_array())
         .cloned()
         .unwrap_or_default();
+    apply_codex_official_model_display_prefix(&mut models);
     let custom_entries = codex_custom_catalog_entries(
         settings,
         config_text,
@@ -7615,6 +7666,135 @@ web_search = "disabled"
             .collect();
         assert!(repeated_slugs.contains(&"gpt-5.5"));
         assert!(repeated_slugs.contains(&"gpt-5.2"));
+    }
+
+    #[test]
+    fn official_login_render_prefixes_official_display_names_and_keeps_custom_unchanged() {
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let codex_dir = temp_home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let official_cache = json!({
+            "fetched_at": "2026-08-13T00:00:00.000000000Z",
+            "etag": "W/\"official\"",
+            "client_version": "0.147.0",
+            "models": [
+                {"slug": "gpt-5.6-sol", "display_name": "gpt-5.6-sol", "displayName": "gpt-5.6-sol"},
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5"}
+            ]
+        });
+        for filename in ["models_cache.json", CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME] {
+            std::fs::write(
+                codex_dir.join(filename),
+                serde_json::to_string(&official_cache).expect("serialize official cache"),
+            )
+            .expect("write official cache");
+        }
+
+        let settings = json!({
+            "enableOfficialLogin": true,
+            "codexCustomModels": [{
+                "model": "deepseek-v4-flash",
+                "providerId": "deepseek",
+                "upstreamModel": "deepseek-v4-flash",
+                "displayName": "DeepSeek V4 Flash"
+            }]
+        });
+
+        write_codex_models_cache_for_official_login_at(codex_dir.clone(), &settings, "", None)
+            .expect("render official-login cache with display prefix");
+
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join("models_cache.json")).expect("read cache"),
+        )
+        .expect("parse cache");
+        let models = written
+            .get("models")
+            .and_then(|v| v.as_array())
+            .expect("models array");
+
+        let official = models
+            .iter()
+            .find(|model| model.get("slug").and_then(Value::as_str) == Some("gpt-5.6-sol"))
+            .expect("official entry rendered");
+        assert_eq!(
+            official.get("display_name").and_then(Value::as_str),
+            Some("官方-gpt-5.6-sol"),
+            "official display_name must carry the official prefix"
+        );
+        assert_eq!(
+            official.get("displayName").and_then(Value::as_str),
+            Some("官方-gpt-5.6-sol"),
+            "official displayName must carry the official prefix"
+        );
+        let official_legacy = models
+            .iter()
+            .find(|model| model.get("slug").and_then(Value::as_str) == Some("gpt-5.5"))
+            .expect("legacy official entry rendered");
+        assert_eq!(
+            official_legacy.get("display_name").and_then(Value::as_str),
+            Some("官方-GPT-5.5"),
+            "single-field official entries must also be prefixed"
+        );
+
+        let custom = models
+            .iter()
+            .find(|model| model.get("slug").and_then(Value::as_str) == Some("deepseek-v4-flash"))
+            .expect("custom entry rendered");
+        assert_eq!(
+            custom.get("displayName").and_then(Value::as_str),
+            Some("DeepSeek V4 Flash"),
+            "custom entries must keep their own display name"
+        );
+
+        let baseline: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME))
+                .expect("read saved official baseline"),
+        )
+        .expect("parse saved official baseline");
+        let baseline_sol = baseline
+            .get("models")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .find(|model| model.get("slug").and_then(Value::as_str) == Some("gpt-5.6-sol"))
+            .expect("baseline official entry");
+        assert_eq!(
+            baseline_sol.get("display_name").and_then(Value::as_str),
+            Some("gpt-5.6-sol"),
+            "the saved official baseline must stay clean (no prefix)"
+        );
+    }
+
+    #[test]
+    fn official_display_prefix_is_idempotent_and_covers_slug_fallback() {
+        let mut models = json!([
+            {
+                "slug": "gpt-5.6-luna",
+                "display_name": "官方-gpt-5.6-luna",
+                "displayName": "官方-gpt-5.6-luna"
+            },
+            {
+                "slug": "gpt-5.6-terra"
+            }
+        ]);
+        let models = models.as_array_mut().expect("models array");
+        apply_codex_official_model_display_prefix(models);
+        assert_eq!(
+            models[0].get("display_name").and_then(Value::as_str),
+            Some("官方-gpt-5.6-luna"),
+            "already-prefixed names must not be double-prefixed"
+        );
+        assert_eq!(
+            models[1].get("display_name").and_then(Value::as_str),
+            Some("官方-gpt-5.6-terra"),
+            "entries without a display name must fall back to the prefixed slug"
+        );
+        assert_eq!(
+            models[1].get("displayName").and_then(Value::as_str),
+            Some("官方-gpt-5.6-terra"),
+            "slug fallback must fill both display field spellings"
+        );
     }
 
     #[test]
