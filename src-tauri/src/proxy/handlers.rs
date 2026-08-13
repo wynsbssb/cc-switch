@@ -231,6 +231,18 @@ async fn forward_codex_official_models(
     let mut catalog: Value =
         serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({ "models": [] }));
     let mut clean_catalog = catalog.clone();
+    // 官方登录聚合模式下，给官方模型条目加「官方-」前缀，便于和路由到其他
+    // 供应商的自定义模型区分（桌面/CLI 模型列表都从这里拿显示名）。
+    let official_models_key = if catalog.get("models").is_some_and(Value::is_array) {
+        "models"
+    } else if catalog.get("data").is_some_and(Value::is_array) {
+        "data"
+    } else {
+        "models"
+    };
+    if let Some(Value::Array(official_models)) = catalog.get_mut(official_models_key) {
+        crate::codex_config::apply_codex_official_model_display_prefix(official_models);
+    }
     let resolve_provider = |provider_id: &str| {
         crate::codex_config::resolve_codex_custom_catalog_provider_from_db(db, provider_id)
     };
