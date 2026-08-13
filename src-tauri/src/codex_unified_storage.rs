@@ -89,11 +89,62 @@ pub fn status() -> CodexUnifiedStorageOutcome {
     }
 }
 
+/// 路径归一化键（仅用于本地一致性比较）：统一分隔符、Windows 小写、去卷前缀。
+fn normalized_path_key(path: &Path) -> String {
+    let mut s = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = s.strip_prefix("//?/") {
+            s = stripped.to_string();
+        }
+        s = s.to_lowercase();
+    }
+    while s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
+/// 统一存储必须与 Codex 配置目录同根，且绝不能把真实 `~/.codex` 会话迁进
+/// 系统临时目录或另一个 home。历史事故：HOME/CC_SWITCH_TEST_HOME 残留时，
+/// 应用配置目录指向临时目录而 Codex 目录仍是真实目录，enable() 曾把真实会话
+/// 搬进临时目录后链接指向丢失目标，导致“对话数据全没了”。这里在迁移前直接
+/// 拒绝，避免再次发生。
+fn ensure_same_home_root(codex_dir: &Path) -> Result<(), AppError> {
+    let app_root = get_app_config_dir().parent().map(normalized_path_key);
+    let codex_root = codex_dir.parent().map(normalized_path_key);
+    if app_root.is_some() && codex_root.is_some() && app_root == codex_root {
+        // 同根时再兜一层：Codex 目录不在临时目录、统一目录却在临时目录，
+        // 说明残留测试环境（CC_SWITCH_TEST_HOME/HOME 指向临时路径）。
+        let temp_key = normalized_path_key(&std::env::temp_dir());
+        let codex_under_temp = codex_root
+            .as_deref()
+            .map(|root| root.starts_with(&temp_key))
+            .unwrap_or(false);
+        let unified_under_temp = normalized_path_key(&unified_home()).starts_with(&temp_key);
+        if !codex_under_temp && unified_under_temp {
+            return Err(AppError::Message(format!(
+                "统一存储目录 {} 位于系统临时目录下（Codex 目录 {} 不在），疑似残留 CC_SWITCH_TEST_HOME/HOME 测试环境，拒绝启用以免迁移真实会话",
+                unified_home().display(),
+                codex_dir.display()
+            )));
+        }
+        return Ok(());
+    }
+    Err(AppError::Message(format!(
+        "Codex 配置目录（{}）与应用配置目录（{}）不同根，无法安全启用统一存储；请检查 HOME / CC_SWITCH_TEST_HOME / app_config_dir 覆盖是否残留",
+        codex_dir.display(),
+        get_app_config_dir().display()
+    )))
+}
+
 /// 启用统一存储：迁移已有数据到统一目录，然后在 `~/.codex` 下建目录链接。
 /// 幂等：已迁移/已链接时直接跳过对应步骤。
 pub fn enable() -> Result<CodexUnifiedStorageOutcome, AppError> {
     let mut outcome = status();
     let codex_dir = crate::codex_config::get_codex_config_dir();
+    // 先做同根校验，任何迁移/建链发生前就拒绝，绝不动真实会话数据。
+    ensure_same_home_root(&codex_dir)?;
     fs::create_dir_all(&codex_dir).map_err(|e| AppError::io(&codex_dir, e))?;
 
     // 状态库最可能被桌面端占用，先迁它：失败时尚未动 sessions，整体可干净重试。
@@ -169,9 +220,30 @@ fn is_dir_link(path: &Path) -> bool {
     }
 }
 
+/// 读取目录链接（junction / symlink）当前指向的目标；非链接或读取失败返回 None。
+fn link_target(path: &Path) -> Option<PathBuf> {
+    fs::read_link(path).ok()
+}
+
 fn create_dir_link(link: &Path, target: &Path) -> Result<(), AppError> {
     if is_dir_link(link) {
-        return Ok(());
+        // 自愈：链接目标与期望统一目录不一致时（例如残留测试环境把链接指到
+        // 临时目录，或统一目录被手动移动过）撤掉重建，避免 Codex 读写错位。
+        if let Some(current) = link_target(link) {
+            if normalized_path_key(&current) != normalized_path_key(target) {
+                log::warn!(
+                    "重建目录链接 {}：当前指向 {}，期望 {}",
+                    link.display(),
+                    current.display(),
+                    target.display()
+                );
+                remove_dir_link(link)?;
+            } else {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
     }
     if link.exists() {
         return Err(AppError::Message(format!(
