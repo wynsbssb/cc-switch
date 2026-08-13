@@ -54,6 +54,8 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 // CODEX_HOME and seed different model templates.
 #[cfg(not(test))]
 static CODEX_MODEL_CATALOG_TEMPLATE_CACHE: OnceCell<Value> = OnceCell::new();
+#[cfg(not(test))]
+static CODEX_CLIENT_VERSION_CACHE: OnceCell<Option<String>> = OnceCell::new();
 
 /// Top-level `config.toml` key that controls Codex's built-in web-search tool.
 pub(crate) const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
@@ -1017,6 +1019,157 @@ fn codex_catalog_model_entry(
     entry
 }
 
+fn codex_provider_id_parts(provider_id: &str) -> (String, u64) {
+    let provider_suffix: String = provider_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let provider_suffix = provider_suffix.trim_matches('-');
+    let provider_suffix = if provider_suffix.is_empty() {
+        "provider".to_string()
+    } else {
+        provider_suffix.to_string()
+    };
+
+    let provider_hash = provider_id
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    (provider_suffix, provider_hash)
+}
+
+pub(crate) fn codex_provider_separator_model_id(provider_id: &str) -> String {
+    let (provider_suffix, provider_hash) = codex_provider_id_parts(provider_id);
+
+    // Keep the id independent of catalog position. The model cache may omit a
+    // stale provider while the Desktop whitelist still sees its saved mapping;
+    // position-based ids would then differ and the picker would hide the row.
+    // A small deterministic hash also prevents sanitized provider ids from
+    // colliding (for example `foo/bar` and `foo-bar`).
+    format!("cc-switch-provider-divider-{provider_suffix}-{provider_hash:016x}")
+}
+
+/// Return the actual ids written to the Desktop model catalog for custom rows.
+///
+/// Codex uses the model id as the picker/request key, so two rows with the same
+/// public id cannot be selected independently. Keep every configured row, but
+/// give repeated ids a stable provider/occurrence-qualified catalog id while
+/// leaving their display names untouched. A single row keeps its original id
+/// for backwards compatibility.
+pub(crate) fn codex_custom_catalog_model_ids(entries: &[CodexCustomModelEntry]) -> Vec<String> {
+    // Count distinct provider groups for each normalized public id. Any id
+    // appearing in more than one group needs a qualified catalog key.
+    let mut provider_groups: std::collections::HashMap<String, HashSet<String>> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        let normalized_model =
+            crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(&entry.model).to_string();
+        provider_groups
+            .entry(normalized_model)
+            .or_default()
+            .insert(entry.provider_id.clone());
+    }
+
+    let mut provider_counts: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        let normalized_model =
+            crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(&entry.model).to_string();
+        *provider_counts
+            .entry((normalized_model, entry.provider_id.clone()))
+            .or_default() += 1;
+    }
+
+    let mut provider_occurrences: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    let mut first_model_occurrences = HashSet::new();
+    entries
+        .iter()
+        .map(|entry| {
+            let normalized_model =
+                crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(&entry.model)
+                    .to_string();
+            let provider_count = provider_groups
+                .get(&normalized_model)
+                .map_or(0, HashSet::len);
+            let key = (normalized_model.clone(), entry.provider_id.clone());
+            let total_in_provider = provider_counts.get(&key).copied().unwrap_or(0);
+            let occurrence = provider_occurrences.entry(key).or_insert(0);
+            *occurrence += 1;
+            let first_model_occurrence = first_model_occurrences.insert(normalized_model);
+
+            if (provider_count <= 1 && total_in_provider == 1)
+                || (provider_count > 1 && first_model_occurrence)
+            {
+                return entry.model.clone();
+            }
+
+            let (provider_suffix, provider_hash) = codex_provider_id_parts(&entry.provider_id);
+            format!(
+                "{}--cc-switch-provider-{}-{:016x}-{}",
+                entry.model, provider_suffix, provider_hash, occurrence
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn codex_custom_catalog_whitelist_model_ids(settings: &Value) -> Vec<String> {
+    let entries = codex_custom_model_entries(settings);
+    let catalog_model_ids = codex_custom_catalog_model_ids(&entries);
+    let mut seen_provider_ids = HashSet::new();
+    let mut model_ids = Vec::with_capacity(entries.len().saturating_mul(2));
+
+    for (entry, catalog_model_id) in entries.iter().zip(catalog_model_ids) {
+        if seen_provider_ids.insert(entry.provider_id.clone()) {
+            model_ids.push(codex_provider_separator_model_id(&entry.provider_id));
+        }
+        model_ids.push(catalog_model_id);
+    }
+
+    model_ids
+}
+
+fn codex_provider_separator_catalog_entry(
+    source_entry: &Value,
+    provider_id: &str,
+    provider_name: &str,
+    priority: usize,
+) -> Value {
+    // Clone the fully-built real model entry instead of the generic native
+    // template. The desktop app validates the complete model-cache shape;
+    // keeping the provider/model-specific fields prevents it from dropping
+    // this synthetic divider (and avoids a cache rebuild on startup).
+    let mut entry = source_entry.clone();
+    let Some(entry_obj) = entry.as_object_mut() else {
+        return json!({});
+    };
+
+    let model_id = codex_provider_separator_model_id(provider_id);
+    let display_name = format!("------ {} ------", provider_name.trim());
+
+    // Codex has no non-selectable section/header item in its model catalog.
+    // Emit a dedicated catalog row so the divider is visually separate from
+    // the first real model instead of corrupting that model's display name.
+    entry_obj.insert("model".to_string(), json!(model_id));
+    entry_obj.insert("slug".to_string(), json!(model_id));
+    entry_obj.insert("display_name".to_string(), json!(display_name));
+    entry_obj.insert("displayName".to_string(), json!(display_name));
+    entry_obj.insert("description".to_string(), json!(display_name));
+    entry_obj.insert("priority".to_string(), json!(1000 + priority));
+    entry_obj.insert("visibility".to_string(), json!("list"));
+
+    codex_catalog_add_camel_case_aliases(&mut entry);
+    entry
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexCatalogModelSpec {
     model: String,
@@ -1183,7 +1336,10 @@ pub(crate) fn codex_custom_model_entries(settings: &Value) -> Vec<CodexCustomMod
     };
 
     let mut entries = Vec::new();
-    let mut seen = HashSet::new();
+    // Model ids are only unique within one provider group. Keep the same
+    // upstream/public id when it is mapped under different providers so the
+    // provider separators can expose both mappings in the Desktop menu.
+    let mut seen_provider_models = HashSet::new();
     for item in items {
         let Some(model) = item
             .get("model")
@@ -1231,10 +1387,13 @@ pub(crate) fn codex_custom_model_entries(settings: &Value) -> Vec<CodexCustomMod
 
         // ?? key ?????????? `[1M]` ????????????
         // `foo` ? `foo[1M]` ????????????????????
-        let dedup_key =
+        let normalized_model =
             crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(model).to_string();
-        if !seen.insert(dedup_key) {
-            log::warn!("[codex] ???????????? `{model}`????????");
+        let provider_model_key = (provider_id.clone(), normalized_model);
+        if !seen_provider_models.insert(provider_model_key) {
+            log::warn!(
+                "[codex] skipping duplicate model `{model}` within provider `{provider_id}`"
+            );
             continue;
         }
         entries.push(CodexCustomModelEntry {
@@ -1387,7 +1546,7 @@ fn write_codex_models_cache_for_aggregate_at(
 ///
 /// 官方登录聚合模式下，给官方模型的菜单显示名加「官方-」前缀，与路由到
 /// 其他供应商的自定义模型区分（例如 `官方-gpt-5.6-sol`）。
-/// 
+///
 /// 只改写渲染用的缓存副本，不触碰保存的官方基线；已带前缀的条目保持
 /// 原样（幂等），没有显示名的条目回退到前缀 + slug。
 pub(crate) fn apply_codex_official_model_display_prefix(models: &mut [Value]) {
@@ -1432,7 +1591,7 @@ pub(crate) fn apply_codex_official_model_display_prefix(models: &mut [Value]) {
 /// （cc-switch 生成的 etag）时删除 live 缓存，让 Codex 桌面端立即拉官方模型。
 /// 否则把一个没有官方模型的缓存标成 fresh（300s TTL），会阻断桌面端恢复
 /// 真实官方目录，自定义模型也会一直排挤掉官方模型。
-/// 
+///
 /// 渲染出的官方模型条目显示名会带上
 /// [`CODEX_OFFICIAL_MODEL_DISPLAY_PREFIX`]（例如 `官方-gpt-5.6-sol`），
 /// 与路由到其他供应商的自定义模型区分；保存的官方基线保持原样。
@@ -1852,7 +2011,7 @@ fn codex_version_command(candidate: &Path) -> Command {
     command
 }
 
-fn detect_codex_cli_client_version() -> Option<String> {
+fn detect_codex_cli_client_version_uncached() -> Option<String> {
     for candidate in codex_cli_candidates() {
         let candidate_label = candidate.to_string_lossy();
         let output = match codex_version_command(&candidate).output() {
@@ -1880,6 +2039,20 @@ fn detect_codex_cli_client_version() -> Option<String> {
         log::debug!("failed to parse Codex version from `{candidate_label} --version`");
     }
     None
+}
+
+fn detect_codex_cli_client_version() -> Option<String> {
+    #[cfg(not(test))]
+    {
+        return CODEX_CLIENT_VERSION_CACHE
+            .get_or_init(detect_codex_cli_client_version_uncached)
+            .clone();
+    }
+
+    #[cfg(test)]
+    {
+        detect_codex_cli_client_version_uncached()
+    }
 }
 
 /// Resolve the client version used by Codex to validate `models_cache.json`.
@@ -2570,10 +2743,11 @@ pub(crate) fn codex_custom_catalog_entries(
     }
     let native_template = load_codex_native_responses_template();
     let mut proxy_chat_template = None;
-    let mut catalog_entries = Vec::with_capacity(entries.len());
+    let mut catalog_entries = Vec::with_capacity(entries.len().saturating_mul(2));
     let mut seen_provider_ids = HashSet::new();
+    let catalog_model_ids = codex_custom_catalog_model_ids(&entries);
 
-    for (index, entry) in entries.iter().enumerate() {
+    for (entry, catalog_model_id) in entries.iter().zip(catalog_model_ids.iter()) {
         let bound_provider = match resolve_provider {
             Some(resolve) => {
                 let Some(provider) = resolve(&entry.provider_id) else {
@@ -2613,27 +2787,19 @@ pub(crate) fn codex_custom_catalog_entries(
             .upstream_model
             .as_deref()
             .or(provider_default_model.as_deref());
-        // Codex Desktop currently exposes no native section/header field in its model picker.
-        // Prefix the first real model of each provider with a visual separator instead of
-        // inserting a fake selectable model entry.
-        let base_display_name = entry
+        let first_for_provider = seen_provider_ids.insert(entry.provider_id.clone());
+        let provider_name = bound_provider
+            .as_ref()
+            .map(|provider| provider.name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(entry.provider_id.as_str());
+        let display_name = entry
             .display_name
             .clone()
             .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| entry.model.clone());
-        let first_for_provider = seen_provider_ids.insert(entry.provider_id.clone());
-        let display_name = if first_for_provider {
-            bound_provider
-                .as_ref()
-                .map(|provider| provider.name.trim())
-                .filter(|name| !name.is_empty())
-                .map(|provider_name| format!("------ {provider_name} ------  {base_display_name}"))
-                .or(Some(base_display_name))
-        } else {
-            Some(base_display_name)
-        };
+            .or_else(|| (catalog_model_id != &entry.model).then(|| entry.model.clone()));
         let spec = CodexCatalogModelSpec {
-            model: entry.model.clone(),
+            model: catalog_model_id.clone(),
             display_name,
             context_window: entry.context_window,
             supports_parallel_tool_calls: entry.supports_parallel_tool_calls,
@@ -2655,38 +2821,47 @@ pub(crate) fn codex_custom_catalog_entries(
             }),
             base_instructions: entry.base_instructions.clone(),
         };
-        if let Some(vendor_models) =
+        let real_entry = if let Some(vendor_models) =
             bound_config_text.and_then(|text| codex_official_vendor_catalog_models(text, profile))
         {
-            catalog_entries.push(codex_vendor_catalog_model_entry(
+            codex_vendor_catalog_model_entry(
                 &vendor_models,
                 &spec,
-                index,
+                catalog_entries.len() + usize::from(first_for_provider),
                 capability_model,
-            ));
-            continue;
-        }
-
-        let template = match profile {
-            CodexCatalogToolProfile::ProxyChat => {
-                if proxy_chat_template.is_none() {
-                    proxy_chat_template = Some(load_codex_model_catalog_template()?);
+            )
+        } else {
+            let template = match profile {
+                CodexCatalogToolProfile::ProxyChat => {
+                    if proxy_chat_template.is_none() {
+                        proxy_chat_template = Some(load_codex_model_catalog_template()?);
+                    }
+                    proxy_chat_template
+                        .as_ref()
+                        .expect("ProxyChat template initialized")
                 }
-                proxy_chat_template
-                    .as_ref()
-                    .expect("ProxyChat template initialized")
-            }
-            CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic => {
-                &native_template
-            }
+                CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic => {
+                    &native_template
+                }
+            };
+            codex_catalog_model_entry(
+                template,
+                &spec,
+                catalog_entries.len() + usize::from(first_for_provider),
+                profile,
+                default_context_window,
+            )
         };
-        catalog_entries.push(codex_catalog_model_entry(
-            template,
-            &spec,
-            index,
-            profile,
-            default_context_window,
-        ));
+
+        if first_for_provider {
+            catalog_entries.push(codex_provider_separator_catalog_entry(
+                &real_entry,
+                &entry.provider_id,
+                provider_name,
+                catalog_entries.len(),
+            ));
+        }
+        catalog_entries.push(real_entry);
     }
 
     Ok(catalog_entries)
@@ -5786,21 +5961,29 @@ base_url = "https://production.api/v1"
             Some(&resolve_provider),
         )
         .expect("build aggregate catalog entries");
+        let chat_entry = entries
+            .iter()
+            .find(|entry| entry.get("slug") == Some(&json!("gpt-5.4-mini")))
+            .expect("chat model entry");
+        let native_entry = entries
+            .iter()
+            .find(|entry| entry.get("slug") == Some(&json!("gpt-5.2")))
+            .expect("native model entry");
         assert_eq!(
-            entries[0]
+            chat_entry
                 .get("apply_patch_tool_type")
                 .and_then(|value| value.as_str()),
             Some("freeform"),
             "a Chat route must keep the freeform apply_patch surface"
         );
         assert!(
-            entries[1].get("apply_patch_tool_type").is_none(),
+            native_entry.get("apply_patch_tool_type").is_none(),
             "a native Responses route must suppress freeform apply_patch"
         );
     }
 
     #[test]
-    fn aggregate_catalog_adds_provider_separator_to_each_groups_first_model() {
+    fn aggregate_catalog_adds_provider_separator_as_a_separate_model() {
         let mut deepseek = Provider::with_id(
             "deepseek-provider".to_string(),
             "DeepSeek".to_string(),
@@ -5857,17 +6040,32 @@ base_url = "https://production.api/v1"
         )
         .expect("build provider-grouped catalog entries");
 
+        assert_eq!(entries.len(), 5);
         assert_eq!(
             entries[0].get("display_name").and_then(Value::as_str),
-            Some("------ DeepSeek ------  DeepSeek V4")
+            Some("------ DeepSeek ------")
+        );
+        assert_eq!(
+            entries[0].get("slug"),
+            Some(&json!(codex_provider_separator_model_id(
+                "deepseek-provider"
+            )))
         );
         assert_eq!(
             entries[1].get("display_name").and_then(Value::as_str),
-            Some("DeepSeek V3")
+            Some("DeepSeek V4")
         );
         assert_eq!(
             entries[2].get("display_name").and_then(Value::as_str),
-            Some("------ GLM ------  GLM-5")
+            Some("DeepSeek V3")
+        );
+        assert_eq!(
+            entries[3].get("display_name").and_then(Value::as_str),
+            Some("------ GLM ------")
+        );
+        assert_eq!(
+            entries[4].get("display_name").and_then(Value::as_str),
+            Some("GLM-5")
         );
     }
 
@@ -5905,12 +6103,9 @@ base_url = "https://production.api/v1"
         )
         .expect("build aggregate catalog entries");
 
-        let entry = &entries[0];
+        let entry = &entries[1];
         assert_eq!(entry.get("slug"), Some(&json!("gpt-5.2")));
-        assert_eq!(
-            entry.get("display_name"),
-            Some(&json!("------ DeepSeek Provider ------  gpt-5.2"))
-        );
+        assert_eq!(entry.get("display_name"), Some(&json!("gpt-5.2")));
         assert_eq!(entry.get("apply_patch_tool_type"), Some(&json!("freeform")));
         assert!(entry
             .get("base_instructions")
@@ -6060,9 +6255,9 @@ base_url = "https://production.api/v1"
         )
         .expect("build aggregate catalog entries");
 
-        assert_eq!(entries[0].get("slug"), Some(&json!("DEEPSEEK-V4-PRO")));
+        assert_eq!(entries[1].get("slug"), Some(&json!("DEEPSEEK-V4-PRO")));
         assert_eq!(
-            entries[0].get("display_name"),
+            entries[1].get("display_name"),
             Some(&json!("DEEPSEEK-V4-PRO"))
         );
     }
@@ -6194,9 +6389,9 @@ base_url = "https://production.api/v1"
         )
         .expect("build aggregate catalog entries");
 
-        assert_eq!(entries[0].get("slug"), Some(&json!("gpt-5.2")));
+        assert_eq!(entries[1].get("slug"), Some(&json!("gpt-5.2")));
         assert_eq!(
-            entries[0].get("input_modalities"),
+            entries[1].get("input_modalities"),
             Some(&json!(["text", "image"])),
             "capabilities must follow the routed upstream model, not the public slot"
         );
@@ -6235,7 +6430,7 @@ base_url = "https://production.api/v1"
         .expect("build aggregate catalog entries");
 
         assert_eq!(
-            entries[0].get("input_modalities"),
+            entries[1].get("input_modalities"),
             Some(&json!(["text", "image"])),
             "an omitted upstream override must inherit the bound provider's routed model"
         );
@@ -6281,7 +6476,7 @@ base_url = "https://production.api/v1"
         .expect("build aggregate catalog entries");
 
         assert_eq!(
-            entries[0].get("input_modalities"),
+            entries[1].get("input_modalities"),
             Some(&json!(["text"])),
             "the bound provider's explicit capability declaration must win"
         );
@@ -7251,7 +7446,14 @@ web_search = "disabled"
             slugs.contains(&"deepseek-v4-flash"),
             "custom model must be present: {slugs:?}"
         );
-        assert_eq!(slugs.len(), 1, "only the mapped custom model should remain");
+        assert_eq!(
+            slugs,
+            vec![
+                codex_provider_separator_model_id("deepseek"),
+                "deepseek-v4-flash".to_string(),
+            ],
+            "the provider divider and mapped custom model should remain"
+        );
         assert!(
             written
                 .get("etag")
@@ -7410,8 +7612,13 @@ web_search = "disabled"
             .collect();
         assert_eq!(
             slugs,
-            vec!["gpt-5.2", "gpt-5.5"],
-            "only mapped carrier slots remain, stale official entries cleared"
+            vec![
+                codex_provider_separator_model_id("deepseek"),
+                "gpt-5.2".to_string(),
+                codex_provider_separator_model_id("glm"),
+                "gpt-5.5".to_string(),
+            ],
+            "provider dividers and mapped carrier slots remain, stale official entries cleared"
         );
     }
 
@@ -7683,7 +7890,10 @@ web_search = "disabled"
                 {"slug": "gpt-5.5", "display_name": "GPT-5.5"}
             ]
         });
-        for filename in ["models_cache.json", CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME] {
+        for filename in [
+            "models_cache.json",
+            CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME,
+        ] {
             std::fs::write(
                 codex_dir.join(filename),
                 serde_json::to_string(&official_cache).expect("serialize official cache"),
@@ -7748,8 +7958,10 @@ web_search = "disabled"
         );
 
         let baseline: Value = serde_json::from_str(
-            &std::fs::read_to_string(codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME))
-                .expect("read saved official baseline"),
+            &std::fs::read_to_string(
+                codex_dir.join(CC_SWITCH_CODEX_OFFICIAL_MODELS_CACHE_FILENAME),
+            )
+            .expect("read saved official baseline"),
         )
         .expect("parse saved official baseline");
         let baseline_sol = baseline
@@ -8885,7 +9097,7 @@ model_catalog_json = "cc-switch-model-catalog.json"
     }
 
     #[test]
-    fn custom_model_entries_parse_and_dedupe() {
+    fn custom_model_entries_parse_preserves_cross_provider_duplicates() {
         let settings = json!({
             "codexCustomModels": [
                 {
@@ -8918,8 +9130,8 @@ model_catalog_json = "cc-switch-model-catalog.json"
         let entries = codex_custom_model_entries(&settings);
         assert_eq!(
             entries.len(),
-            2,
-            "duplicate (including [1M]-suffixed) and empty model ids are skipped"
+            4,
+            "empty model ids are skipped, but the same model under different providers is kept"
         );
         assert_eq!(entries[0].model, "my-deepseek");
         assert_eq!(entries[0].provider_id, "prov-1");
@@ -8929,12 +9141,51 @@ model_catalog_json = "cc-switch-model-catalog.json"
             entries[0].input_modalities.as_deref(),
             Some(&["text".to_string()][..])
         );
-        assert_eq!(entries[1].model, "snake-case");
-        assert_eq!(entries[1].provider_id, "prov-4");
+        assert_eq!(entries[1].model, "my-deepseek");
+        assert_eq!(entries[1].provider_id, "prov-2");
+        assert_eq!(entries[2].model, "snake-case");
+        assert_eq!(entries[2].provider_id, "prov-4");
+        assert_eq!(entries[3].model, "my-deepseek[1M]");
+        assert_eq!(entries[3].provider_id, "prov-5");
         assert_eq!(
-            entries[1].upstream_model.as_deref(),
+            entries[2].upstream_model.as_deref(),
             Some("deepseek-reasoner")
         );
+    }
+
+    #[test]
+    fn custom_catalog_model_ids_keep_same_model_per_provider_selectable() {
+        let settings = json!({
+            "codexCustomModels": [
+                {
+                    "model": "deepseek-v4",
+                    "providerId": "provider-a",
+                    "displayName": "DeepSeek V4"
+                },
+                {
+                    "model": "deepseek-v4",
+                    "providerId": "provider-b",
+                    "displayName": "DeepSeek V4"
+                },
+                {
+                    "model": "deepseek-v3",
+                    "providerId": "provider-b"
+                }
+            ]
+        });
+        let entries = codex_custom_model_entries(&settings);
+        let ids = codex_custom_catalog_model_ids(&entries);
+
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], "deepseek-v4");
+        assert_ne!(ids[1], ids[0]);
+        assert!(ids[1].starts_with("deepseek-v4--cc-switch-provider-provider-b-"));
+        assert_eq!(ids[2], "deepseek-v3");
+
+        let whitelist = codex_custom_catalog_whitelist_model_ids(&settings);
+        assert!(whitelist.contains(&ids[0]));
+        assert!(whitelist.contains(&ids[1]));
+        assert!(whitelist.contains(&ids[2]));
     }
 
     #[test]

@@ -41,9 +41,11 @@ use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
 use toml_edit::DocumentMut;
 
+#[cfg(test)]
+use crate::codex_config::codex_provider_separator_model_id;
 use crate::codex_config::{
-    get_codex_model_catalog_path, read_codex_model_catalog_simplified_from_live,
-    resolve_cc_switch_catalog_path,
+    codex_custom_catalog_whitelist_model_ids, get_codex_model_catalog_path,
+    read_codex_model_catalog_simplified_from_live, resolve_cc_switch_catalog_path,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::config::get_home_dir;
@@ -139,12 +141,11 @@ fn codex_model_ids_from_settings(settings: &Value) -> Vec<String> {
         }
     }
 
-    if let Some(custom_models) = settings.get("codexCustomModels").and_then(Value::as_array) {
-        for item in custom_models {
-            if let Some(model) = item.get("model").and_then(Value::as_str) {
-                push_id(model, &mut seen, &mut ids);
-            }
-        }
+    // The provider headings are real synthetic catalog rows. They must pass
+    // the same Desktop Statsig whitelist as normal models or the picker hides
+    // them even though they are present in models_cache.json.
+    for model in codex_custom_catalog_whitelist_model_ids(settings) {
+        push_id(&model, &mut seen, &mut ids);
     }
 
     ids
@@ -1279,6 +1280,37 @@ pub(crate) fn sync_codex_desktop_available_models_cache_after_provider_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_model_ids_from_settings_includes_provider_divider_rows() {
+        let settings = json!({
+            "codexCustomModels": [
+                {
+                    "model": "deepseek-v4-flash",
+                    "routes": [{ "providerId": "deepseek-provider" }]
+                },
+                {
+                    "model": "deepseek-v4-pro",
+                    "routes": [{ "providerId": "deepseek-provider" }]
+                },
+                {
+                    "model": "glm-5",
+                    "routes": [{ "providerId": "glm-provider" }]
+                }
+            ]
+        });
+
+        assert_eq!(
+            codex_model_ids_from_settings(&settings),
+            vec![
+                codex_provider_separator_model_id("deepseek-provider"),
+                "deepseek-v4-flash".to_string(),
+                "deepseek-v4-pro".to_string(),
+                codex_provider_separator_model_id("glm-provider"),
+                "glm-5".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn codex_desktop_statsig_merge_appends_models_without_duplicates() {

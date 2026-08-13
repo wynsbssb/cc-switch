@@ -252,10 +252,18 @@ fn codex_custom_model_entry_for_request(
     model: &str,
 ) -> Option<crate::codex_config::CodexCustomModelEntry> {
     let entries = crate::codex_config::codex_custom_model_entries(&official.settings_config);
+    let catalog_model_ids = crate::codex_config::codex_custom_catalog_model_ids(&entries);
     let request_model = crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(model);
-    let exact = entries.iter().find(|entry| {
-        crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(&entry.model) == request_model
-    });
+    let exact = entries
+        .iter()
+        .zip(catalog_model_ids.iter())
+        .find(|(entry, catalog_model_id)| {
+            crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(catalog_model_id)
+                == request_model
+                || crate::proxy::model_mapper::strip_one_m_suffix_for_upstream(&entry.model)
+                    == request_model
+        })
+        .map(|(entry, _)| entry);
     let legacy_alias =
         if crate::codex_config::codex_official_login_enabled(&official.settings_config) {
             None
