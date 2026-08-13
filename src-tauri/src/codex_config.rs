@@ -486,8 +486,9 @@ pub fn write_codex_live_config_atomic(config_text_opt: Option<&str>) -> Result<(
 /// write so plugin state survives ("auto-sync").
 ///
 /// A missing/unreadable/invalid existing file is tolerated and returns the
-/// new config unchanged; the new config stays authoritative when it already
-/// declares its own plugins / marketplaces tables.
+/// new config unchanged. Plugin and marketplace tables are merged entry by
+/// entry: entries explicitly declared by the new config stay authoritative,
+/// while unrelated registrations from the existing live config are retained.
 pub fn merge_codex_plugin_sections(
     existing_config: &str,
     new_config: &str,
@@ -516,7 +517,20 @@ pub fn merge_codex_plugin_sections(
         let Some(item) = existing.remove(key) else {
             continue;
         };
-        if item.is_table_like() && !target.contains_key(key) {
+        let Some(existing_table) = item.as_table_like() else {
+            continue;
+        };
+
+        if let Some(target_table) = target
+            .get_mut(key)
+            .and_then(|item| item.as_table_like_mut())
+        {
+            for (entry_id, entry) in existing_table.iter() {
+                if target_table.get(entry_id).is_none() {
+                    target_table.insert(entry_id, entry.clone());
+                }
+            }
+        } else if !target.contains_key(key) {
             target[key] = item;
         }
     }
@@ -4664,11 +4678,26 @@ base_url = "https://api.deepseek.com"
     }
 
     #[test]
-    fn merge_plugin_sections_keeps_new_config_authoritative() {
-        let existing = r#"[plugins."github@echobird-cn"]
+    fn merge_plugin_sections_merges_entries_and_keeps_new_entry_authoritative() {
+        let existing = r#"[marketplaces.openai-primary-runtime]
+source_type = "local"
+source = "C:/old-runtime"
+
+[marketplaces.echobird-cn]
+source_type = "github"
+source = "https://github.com/echobird-cn/codex-plugins"
+
+[plugins."github@echobird-cn"]
 enabled = true
+
+[plugins."pdf@openai-primary-runtime"]
+enabled = false
 "#;
         let new_config = r#"model = "gpt-5.4"
+
+[marketplaces.openai-primary-runtime]
+source_type = "local"
+source = "C:/new-runtime"
 
 [plugins."pdf@openai-primary-runtime"]
 enabled = true
@@ -4679,10 +4708,29 @@ enabled = true
             .get("plugins")
             .and_then(|v| v.as_table())
             .expect("plugins table");
+        let marketplaces = parsed
+            .get("marketplaces")
+            .and_then(|v| v.as_table())
+            .expect("marketplaces table");
 
-        // New config's own plugin table wins; the existing one is not merged in.
-        assert!(plugins.contains_key("pdf@openai-primary-runtime"));
-        assert!(!plugins.contains_key("github@echobird-cn"));
+        // Unrelated registrations from the live config survive.
+        assert!(plugins.contains_key("github@echobird-cn"));
+        assert!(marketplaces.contains_key("echobird-cn"));
+        // A same-name entry explicitly supplied by the new config wins.
+        assert_eq!(
+            plugins
+                .get("pdf@openai-primary-runtime")
+                .and_then(|v| v.get("enabled"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            marketplaces
+                .get("openai-primary-runtime")
+                .and_then(|v| v.get("source"))
+                .and_then(|v| v.as_str()),
+            Some("C:/new-runtime")
+        );
     }
 
     #[test]
