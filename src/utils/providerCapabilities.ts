@@ -10,6 +10,41 @@ import {
 export const CODEX_OFFICIAL_PROVIDER_ID = "codex-official";
 export const GROKBUILD_OFFICIAL_PROVIDER_ID = "grokbuild-official";
 
+/** Whether the built-in Codex provider contains an enabled, usable model mapping. */
+export function providerHasCodexModelAggregation(
+  appId: AppId,
+  provider: Provider,
+): boolean {
+  if (!supportsOfficialProxyTakeover(appId, provider)) return false;
+
+  const settings = provider.settingsConfig as Record<string, unknown>;
+  if (settings.codexAggregationEnabled === false) return false;
+
+  const models = settings.codexCustomModels;
+  if (!Array.isArray(models)) return false;
+
+  return models.some((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+
+    const model = entry as Record<string, unknown>;
+    if (typeof model.model !== "string" || !model.model.trim()) return false;
+
+    const routes = model.routes;
+    if (Array.isArray(routes)) {
+      return routes.some(
+        (route) =>
+          !!route &&
+          typeof route === "object" &&
+          typeof (route as Record<string, unknown>).providerId === "string" &&
+          !!((route as Record<string, unknown>).providerId as string).trim(),
+      );
+    }
+
+    // Backward compatibility with the former single-route model shape.
+    return typeof model.providerId === "string" && !!model.providerId.trim();
+  });
+}
+
 /** Keep the UI capability rule aligned with the Rust takeover policy. */
 export function supportsOfficialProxyTakeover(
   appId: AppId,

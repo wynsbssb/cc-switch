@@ -14,6 +14,17 @@
 //! overwrite it. A background worker retries while the Desktop holds the LevelDB
 //! lock and renews the pin so the custom ids survive long sessions.
 //!
+//! Evaluation bundles that only carry the models config are pinned with the
+//! full horizon: there is no unrelated evaluation to freeze. The Desktop's real
+//! cache usually bundles the models config with hundreds of unrelated
+//! gates/configs. Such shared bundles are pinned too once every configured id
+//! is present — otherwise the next SDK refresh overwrites the injected ids and
+//! cc-switch cannot re-inject while the Desktop holds the LevelDB lock. Because
+//! Chromium keeps that lock for the whole Desktop session, the pin must cover a
+//! genuinely long-running session rather than relying on in-session renewal.
+//! The background worker renews it when storage is writable and re-injects ids
+//! that the SDK has overwritten as soon as the Desktop releases the lock.
+//!
 //! This is a best-effort, fail-open integration: absent, locked, or unsupported
 //! Desktop storage is logged and never blocks provider switching.
 
@@ -47,10 +58,20 @@ const CODEX_DESKTOP_STATSIG_CACHE_KEY_MARKER: &str = "statsig.cached.evaluations
 const CODEX_DESKTOP_STATSIG_LAST_MODIFIED_KEY_MARKER: &str =
     "statsig.last_modified_time.evaluations";
 const CODEX_DESKTOP_STATSIG_PIN_HORIZON_MILLIS: i64 = 30 * 24 * 60 * 60 * 1_000;
+/// Chromium normally holds the localStorage LevelDB lock for the entire Desktop
+/// process lifetime, so a short shared-bundle pin cannot be renewed while Codex
+/// is running. Use the same long horizon as isolated bundles; otherwise a network
+/// refresh after the short pin expires drops the injected ids and the picker
+/// falls back to `Custom` until Desktop exits.
+const CODEX_DESKTOP_STATSIG_SHARED_PIN_HORIZON_MILLIS: i64 =
+    CODEX_DESKTOP_STATSIG_PIN_HORIZON_MILLIS;
 const CODEX_DESKTOP_CACHE_RETRY_INITIAL_DELAY_SECS: u64 = 1;
 #[cfg(not(test))]
 const CODEX_DESKTOP_CACHE_RETRY_MAX_DELAY_SECS: u64 = 30;
-const CODEX_DESKTOP_CACHE_RENEWAL_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
+/// Renewal cadence while a custom catalog is active. Must stay well below
+/// [`CODEX_DESKTOP_STATSIG_SHARED_PIN_HORIZON_MILLIS`] so shared bundles stay
+/// pinned even when the Desktop is closed for a while between renewals.
+const CODEX_DESKTOP_CACHE_RENEWAL_INTERVAL_SECS: u64 = 24 * 60 * 60;
 static CODEX_DESKTOP_CACHE_SYNC_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CODEX_DESKTOP_CACHE_SYNC_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(not(test))]
@@ -261,10 +282,11 @@ fn codex_desktop_now_millis() -> i64 {
         .unwrap_or_default()
 }
 
-fn pin_codex_desktop_statsig_last_modified_cache_keys(
+fn pin_codex_desktop_statsig_last_modified_cache_keys_at(
     last_modified: &mut Value,
     cache_keys: &HashSet<String>,
     now_millis: i64,
+    horizon_millis: i64,
 ) -> bool {
     if cache_keys.is_empty() {
         return false;
@@ -272,7 +294,7 @@ fn pin_codex_desktop_statsig_last_modified_cache_keys(
     let Some(entries) = last_modified.as_object_mut() else {
         return false;
     };
-    let pinned_until = now_millis.saturating_add(CODEX_DESKTOP_STATSIG_PIN_HORIZON_MILLIS);
+    let pinned_until = now_millis.saturating_add(horizon_millis);
     let mut changed = false;
     for cache_key in cache_keys {
         if entries.get(cache_key).and_then(Value::as_i64) != Some(pinned_until) {
@@ -281,6 +303,19 @@ fn pin_codex_desktop_statsig_last_modified_cache_keys(
         }
     }
     changed
+}
+
+fn pin_codex_desktop_statsig_last_modified_cache_keys(
+    last_modified: &mut Value,
+    cache_keys: &HashSet<String>,
+    now_millis: i64,
+) -> bool {
+    pin_codex_desktop_statsig_last_modified_cache_keys_at(
+        last_modified,
+        cache_keys,
+        now_millis,
+        CODEX_DESKTOP_STATSIG_PIN_HORIZON_MILLIS,
+    )
 }
 
 fn unpin_codex_desktop_statsig_last_modified_cache_keys(
@@ -567,6 +602,7 @@ fn sync_codex_desktop_available_models_cache_path_with_mode(
     let mut model_cache_origins = HashSet::new();
     let mut ready_model_cache_origins = HashSet::new();
     let mut pinned_cache_keys_by_origin: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut pinned_shared_cache_keys_by_origin: HashMap<String, HashSet<String>> = HashMap::new();
     let mut unpinned_cache_keys_by_origin: HashMap<String, HashSet<String>> = HashMap::new();
     let mut model_cache_keys_by_origin: HashMap<String, HashSet<String>> = HashMap::new();
     for (key, key_text, value) in cache_entries {
@@ -581,18 +617,26 @@ fn sync_codex_desktop_available_models_cache_path_with_mode(
         };
         let Some((prefix, encoding, mut wrapper)) = decode_codex_desktop_statsig_wrapper(&value)
         else {
+            log::debug!(
+                "[codex] Desktop statsig evaluation cache entry at {cache_key} could not be decoded; skipping"
+            );
             continue;
         };
         let has_models_config = codex_desktop_statsig_available_model_ids(&wrapper).is_some();
         let models_config_isolated =
             has_models_config && codex_desktop_statsig_has_only_models_config(&wrapper);
+        let changed = merge_codex_desktop_statsig_available_models(&mut wrapper, model_ids);
+        let has_all_models =
+            !model_ids.is_empty() && codex_desktop_statsig_has_all_models(&wrapper, model_ids);
         if has_models_config {
             model_cache_origins.insert(origin.clone());
             model_cache_keys_by_origin
                 .entry(origin.clone())
                 .or_default()
                 .insert(cache_key.clone());
-            if !model_ids.is_empty() && !models_config_isolated {
+            // 共享 bundle 尚未聚合完整时不能钉住（会把无关评估也冻结），保持
+            // 短周期重试，等 Desktop 释放 LevelDB 锁后立即补注并钉住。
+            if !model_ids.is_empty() && !models_config_isolated && !has_all_models {
                 requires_short_retry = true;
                 unpinned_cache_keys_by_origin
                     .entry(origin.clone())
@@ -600,9 +644,6 @@ fn sync_codex_desktop_available_models_cache_path_with_mode(
                     .insert(cache_key.clone());
             }
         }
-        let changed = merge_codex_desktop_statsig_available_models(&mut wrapper, model_ids);
-        let has_all_models =
-            !model_ids.is_empty() && codex_desktop_statsig_has_all_models(&wrapper, model_ids);
         if changed {
             let Some(updated) = encode_codex_desktop_statsig_wrapper(prefix, encoding, &wrapper)
             else {
@@ -610,11 +651,13 @@ fn sync_codex_desktop_available_models_cache_path_with_mode(
             };
             updates.push((key, updated));
         }
-        if has_all_models && models_config_isolated {
-            pinned_cache_keys_by_origin
-                .entry(origin)
-                .or_default()
-                .insert(cache_key);
+        if has_all_models {
+            let pinned = if models_config_isolated {
+                &mut pinned_cache_keys_by_origin
+            } else {
+                &mut pinned_shared_cache_keys_by_origin
+            };
+            pinned.entry(origin).or_default().insert(cache_key);
         }
     }
 
@@ -631,7 +674,13 @@ fn sync_codex_desktop_available_models_cache_path_with_mode(
         let pinned_cache_keys = (!model_ids.is_empty())
             .then(|| pinned_cache_keys_by_origin.get(&origin))
             .flatten();
-        if unpinned_cache_keys.is_none() && pinned_cache_keys.is_none() {
+        let pinned_shared_cache_keys = (!model_ids.is_empty())
+            .then(|| pinned_shared_cache_keys_by_origin.get(&origin))
+            .flatten();
+        if unpinned_cache_keys.is_none()
+            && pinned_cache_keys.is_none()
+            && pinned_shared_cache_keys.is_none()
+        {
             continue;
         }
         let mut changed = false;
@@ -649,15 +698,26 @@ fn sync_codex_desktop_available_models_cache_path_with_mode(
                 now_millis,
             );
         }
-        let pinned_after_update = pinned_cache_keys.is_some_and(|cache_keys| {
-            !cache_keys.is_empty()
-                && cache_keys.iter().all(|cache_key| {
-                    last_modified
-                        .get(cache_key)
-                        .and_then(Value::as_i64)
-                        .is_some_and(|value| value > now_millis)
-                })
-        });
+        if let Some(cache_keys) = pinned_shared_cache_keys {
+            changed |= pin_codex_desktop_statsig_last_modified_cache_keys_at(
+                &mut last_modified,
+                cache_keys,
+                now_millis,
+                CODEX_DESKTOP_STATSIG_SHARED_PIN_HORIZON_MILLIS,
+            );
+        }
+        let pinned_after_update = [pinned_cache_keys, pinned_shared_cache_keys]
+            .into_iter()
+            .flatten()
+            .any(|cache_keys| {
+                !cache_keys.is_empty()
+                    && cache_keys.iter().all(|cache_key| {
+                        last_modified
+                            .get(cache_key)
+                            .and_then(Value::as_i64)
+                            .is_some_and(|value| value > now_millis)
+                    })
+            });
         if pinned_after_update {
             ready_model_cache_origins.insert(origin.clone());
         }
@@ -1309,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_desktop_statsig_pin_rejects_sibling_evaluation_collections() {
+    fn codex_desktop_statsig_has_only_models_config_detects_shared_bundles() {
         let data = json!({
             "dynamic_configs": {
                 CODEX_DESKTOP_STATSIG_MODELS_CONFIG_ID: {
@@ -1326,7 +1386,35 @@ mod tests {
 
         assert!(
             !codex_desktop_statsig_has_only_models_config(&wrapper),
-            "evaluation bundles with sibling collections must not be future-pinned"
+            "shared evaluation bundles must be detected so sync can keep maintaining them"
+        );
+    }
+
+    #[test]
+    fn codex_desktop_statsig_shared_pin_covers_long_locked_sessions() {
+        let mut last_modified = json!({
+            "statsig.cached.evaluations.shared": 1_000,
+        });
+        let cache_keys = HashSet::from(["statsig.cached.evaluations.shared".to_string()]);
+
+        assert!(pin_codex_desktop_statsig_last_modified_cache_keys_at(
+            &mut last_modified,
+            &cache_keys,
+            10_000,
+            CODEX_DESKTOP_STATSIG_SHARED_PIN_HORIZON_MILLIS,
+        ));
+        let pinned = last_modified["statsig.cached.evaluations.shared"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(
+            pinned,
+            10_000 + CODEX_DESKTOP_STATSIG_PIN_HORIZON_MILLIS,
+            "shared bundles must remain pinned for a long-running Desktop session because LevelDB cannot be renewed while Desktop holds the lock"
+        );
+        assert!(
+            CODEX_DESKTOP_CACHE_RENEWAL_INTERVAL_SECS * 1_000
+                < CODEX_DESKTOP_STATSIG_SHARED_PIN_HORIZON_MILLIS as u64,
+            "the background renewal interval must stay below the shared pin horizon"
         );
     }
 
@@ -1417,14 +1505,17 @@ mod tests {
             &["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()],
         )
         .expect("sync temp leveldb");
-        assert_eq!(result.updated_count, 1);
-        assert!(
-            !result.ready_model_cache,
-            "a shared dynamic-config bundle must not be treated as safely pinned"
+        assert_eq!(
+            result.updated_count, 2,
+            "the merged evaluations entry and its pinned last-modified timestamp are both updated"
         );
         assert!(
-            result.requires_short_retry,
-            "a shared dynamic-config bundle needs short maintenance retries"
+            result.ready_model_cache,
+            "a shared dynamic-config bundle with every model present must be pinned so the Desktop SDK does not overwrite the injected ids"
+        );
+        assert!(
+            !result.requires_short_retry,
+            "a fully merged shared bundle is pinned and no longer needs short maintenance retries"
         );
 
         let options = rusty_leveldb::Options {
@@ -1453,9 +1544,94 @@ mod tests {
             .expect("read updated last modified cache");
         let (_, _, last_modified) =
             decode_codex_desktop_statsig_wrapper(&last_modified_value).unwrap();
-        assert_eq!(
-            last_modified["statsig.cached.evaluations.active"].as_i64(),
-            Some(1_000)
+        let pinned = last_modified["statsig.cached.evaluations.active"]
+            .as_i64()
+            .expect("pinned last modified timestamp");
+        assert!(
+            pinned > 1_000,
+            "the shared bundle must be pinned into the future so the SDK keeps the injected models"
+        );
+        assert!(
+            pinned <= codex_desktop_now_millis() + CODEX_DESKTOP_STATSIG_SHARED_PIN_HORIZON_MILLIS,
+            "the shared bundle pin must cover long-running sessions while Desktop holds LevelDB"
+        );
+        db.close().expect("close leveldb");
+    }
+
+    #[test]
+    fn codex_desktop_statsig_shared_bundle_pin_survives_second_sync() {
+        let temp_dir = tempfile::tempdir().expect("create temp leveldb");
+        let options = rusty_leveldb::Options {
+            create_if_missing: true,
+            ..Default::default()
+        };
+        let mut db = rusty_leveldb::DB::open(temp_dir.path(), options).expect("open temp leveldb");
+        let key = b"_https://codex\x00statsig.cached.evaluations.active".to_vec();
+        let last_modified_key =
+            b"_https://codex\x00statsig.last_modified_time.evaluations".to_vec();
+        let data = json!({
+            "dynamic_configs": {
+                CODEX_DESKTOP_STATSIG_MODELS_CONFIG_ID: {
+                    "value": { "available_models": ["gpt-5.5"] }
+                },
+                "unrelated-feature": { "value": { "enabled": true } }
+            }
+        });
+        let wrapper = json!({ "source": "Network", "data": data.to_string() });
+        let value = encode_codex_desktop_statsig_wrapper(
+            Some(1),
+            CodexDesktopStatsigWrapperEncoding::Utf8,
+            &wrapper,
+        )
+        .unwrap();
+        db.put(&key, &value).expect("seed cache");
+        let last_modified_value = encode_codex_desktop_statsig_wrapper(
+            Some(1),
+            CodexDesktopStatsigWrapperEncoding::Utf8,
+            &json!({ "statsig.cached.evaluations.active": 1_000 }),
+        )
+        .unwrap();
+        db.put(&last_modified_key, &last_modified_value)
+            .expect("seed last modified cache");
+        db.close().expect("close seeded leveldb");
+
+        let model_ids = vec!["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()];
+        let first =
+            sync_codex_desktop_available_models_cache_path_with_status(temp_dir.path(), &model_ids)
+                .expect("sync temp leveldb");
+        assert!(
+            first.ready_model_cache,
+            "the shared bundle must be pinned after the first sync"
+        );
+
+        let second =
+            sync_codex_desktop_available_models_cache_path_with_status(temp_dir.path(), &model_ids)
+                .expect("sync temp leveldb again");
+        assert!(
+            second.ready_model_cache,
+            "the pin must survive repeated syncs"
+        );
+        assert!(
+            !second.requires_short_retry,
+            "a fully merged and pinned shared bundle must not schedule short retries"
+        );
+
+        let options = rusty_leveldb::Options {
+            create_if_missing: false,
+            ..Default::default()
+        };
+        let mut db = rusty_leveldb::DB::open(temp_dir.path(), options).expect("reopen leveldb");
+        let last_modified_value = db
+            .get(&last_modified_key)
+            .expect("read updated last modified cache");
+        let (_, _, last_modified) =
+            decode_codex_desktop_statsig_wrapper(&last_modified_value).unwrap();
+        let pinned = last_modified["statsig.cached.evaluations.active"]
+            .as_i64()
+            .expect("pinned last modified timestamp");
+        assert!(
+            pinned > codex_desktop_now_millis(),
+            "the pin must stay in the future after a second sync"
         );
         db.close().expect("close leveldb");
     }

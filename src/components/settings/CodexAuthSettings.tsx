@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   History,
@@ -6,14 +6,13 @@ import {
   HardDriveDownload,
   RotateCcw,
   Loader2,
-  FolderTree,
 } from "lucide-react";
 import { toast } from "sonner";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { settingsApi, type CodexUnifiedStorageResult } from "@/lib/api";
+import { settingsApi } from "@/lib/api";
 
 interface CodexAuthSettingsProps {
   settings: SettingsFormState;
@@ -34,20 +33,6 @@ export function CodexAuthSettings({
   const [showRestoreConfirm, setShowRestoreConfirm] = useState(false);
   const [backupBusy, setBackupBusy] = useState(false);
   const [restoreBusy, setRestoreBusy] = useState(false);
-  const [unifiedBusy, setUnifiedBusy] = useState(false);
-  const [unifiedStatus, setUnifiedStatus] =
-    useState<CodexUnifiedStorageResult | null>(null);
-  const [showUnifiedEnableConfirm, setShowUnifiedEnableConfirm] =
-    useState(false);
-  const [showUnifiedDisableConfirm, setShowUnifiedDisableConfirm] =
-    useState(false);
-
-  useEffect(() => {
-    void settingsApi
-      .getCodexUnifiedStorageStatus()
-      .then(setUnifiedStatus)
-      .catch(() => undefined);
-  }, []);
 
   const handleUnifyHistoryChange = (checked: boolean) => {
     if (checked) {
@@ -158,47 +143,6 @@ export function CodexAuthSettings({
     }
   };
 
-  const handleUnifiedStorageChange = (checked: boolean) => {
-    if (unifiedBusy) return;
-    if (checked) {
-      setShowUnifiedEnableConfirm(true);
-      return;
-    }
-    setShowUnifiedDisableConfirm(true);
-  };
-
-  const handleUnifiedEnable = async () => {
-    setShowUnifiedEnableConfirm(false);
-    setUnifiedBusy(true);
-    try {
-      const result = await settingsApi.enableCodexUnifiedStorage();
-      setUnifiedStatus(result);
-      await onChange({ unifyCodexSessionStorage: true });
-      toast.success(t("settings.unifyCodexStorageEnabled"));
-    } catch (error) {
-      console.error("Failed to enable codex unified storage:", error);
-      toast.error(t("settings.unifyCodexStorageEnableFailed"));
-    } finally {
-      setUnifiedBusy(false);
-    }
-  };
-
-  const handleUnifiedDisable = async () => {
-    setShowUnifiedDisableConfirm(false);
-    setUnifiedBusy(true);
-    try {
-      const result = await settingsApi.disableCodexUnifiedStorage();
-      setUnifiedStatus(result);
-      await onChange({ unifyCodexSessionStorage: false });
-      toast.success(t("settings.unifyCodexStorageDisabled"));
-    } catch (error) {
-      console.error("Failed to disable codex unified storage:", error);
-      toast.error(t("settings.unifyCodexStorageDisableFailed"));
-    } finally {
-      setUnifiedBusy(false);
-    }
-  };
-
   return (
     <section className="space-y-4">
       <div className="flex items-center gap-2 pb-2 border-b border-border/40">
@@ -233,25 +177,6 @@ export function CodexAuthSettings({
           onChange({ backupCodexDesktopConversations: value })
         }
       />
-
-      <ToggleRow
-        icon={<FolderTree className="h-4 w-4 text-violet-500" />}
-        title={t("settings.unifyCodexStorage")}
-        description={t("settings.unifyCodexStorageDescription")}
-        checked={settings.unifyCodexSessionStorage ?? false}
-        disabled={unifiedBusy}
-        onCheckedChange={handleUnifiedStorageChange}
-      />
-      {unifiedStatus?.active ? (
-        <div className="space-y-1 pl-1">
-          <p className="font-mono text-xs text-muted-foreground">
-            {unifiedStatus.sessionsDir}
-          </p>
-          <p className="font-mono text-xs text-muted-foreground">
-            {unifiedStatus.stateDir}
-          </p>
-        </div>
-      ) : null}
 
       <div className="flex flex-wrap items-center gap-2 pl-1">
         <Button
@@ -316,23 +241,6 @@ export function CodexAuthSettings({
         onCancel={() => setShowRestoreConfirm(false)}
       />
 
-      <ConfirmDialog
-        isOpen={showUnifiedEnableConfirm}
-        title={t("confirm.unifyCodexStorage.title")}
-        message={t("confirm.unifyCodexStorage.message")}
-        confirmText={t("confirm.unifyCodexStorage.confirm")}
-        onConfirm={() => void handleUnifiedEnable()}
-        onCancel={() => setShowUnifiedEnableConfirm(false)}
-      />
-
-      <ConfirmDialog
-        isOpen={showUnifiedDisableConfirm}
-        title={t("confirm.unifyCodexStorageOff.title")}
-        message={t("confirm.unifyCodexStorageOff.message")}
-        confirmText={t("confirm.unifyCodexStorageOff.confirm")}
-        onConfirm={() => void handleUnifiedDisable()}
-        onCancel={() => setShowUnifiedDisableConfirm(false)}
-      />
     </section>
   );
 }

@@ -34,6 +34,7 @@ pub mod streaming_responses;
 pub mod transform;
 pub mod transform_codex_anthropic;
 pub mod transform_codex_chat;
+pub mod transform_codex_responses_input;
 pub mod transform_codex_responses_namespace;
 pub mod transform_codex_responses_xai_sanitize;
 pub mod transform_gemini;
@@ -52,8 +53,8 @@ pub use adapter::ProviderAdapter;
 pub use auth::{AuthInfo, AuthStrategy};
 pub use claude::{
     claude_api_format_needs_transform, get_claude_api_format,
-    normalize_anthropic_messages_for_provider, transform_claude_request_for_api_format,
-    ClaudeAdapter,
+    normalize_anthropic_messages_for_provider, provider_requires_reasoning_content_roundtrip,
+    transform_claude_request_for_api_format, ClaudeAdapter,
 };
 pub use codex::CodexAdapter;
 pub use codex::{

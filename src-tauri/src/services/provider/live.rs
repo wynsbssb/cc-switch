@@ -873,9 +873,9 @@ fn restore_live_settings_for_provider_backfill(
         );
     }
 
-    // 统一会话开关注入的共享 `custom` 路由与统一存储注入的 `sqlite_home`
-    // 只属于 live 配置；切换回填时必须剥掉，否则供应商的存储配置被污染，
-    // 关闭开关后无法还原（第三方配置的 custom 表不匹配注入形态，天然跳过）。
+    // 统一会话开关注入的共享 `custom` 路由只属于 live 配置；切换回填时
+    // 必须剥掉，否则供应商的存储配置被污染，关闭开关后无法还原
+    // （第三方配置的 custom 表不匹配注入形态，天然跳过）。
     if let Err(err) =
         crate::codex_config::strip_codex_unified_session_bucket_from_settings(&mut settings)
     {
@@ -884,15 +884,6 @@ fn restore_live_settings_for_provider_backfill(
             provider.id
         );
     }
-    if let Err(err) =
-        crate::codex_config::strip_codex_unified_state_home_from_settings(&mut settings)
-    {
-        log::warn!(
-            "Failed to strip unified sqlite_home while backfilling '{}': {err}",
-            provider.id
-        );
-    }
-
     // `modelCatalog` is a cc-switch–private field whose SSOT is the DB. Live's
     // `config.toml` only carries a lossy projection (`model_catalog_json` →
     // generated catalog file) that proxy takeover/restore cycles and Codex.app

@@ -339,6 +339,51 @@ fn should_preserve_reasoning_content_for_openai_chat(provider: &Provider, body: 
         .any(is_reasoning_vendor_identifier)
 }
 
+/// Whether the routed provider/model requires thinking (reasoning) content to
+/// be replayed verbatim on later requests.
+///
+/// Chat-completions vendors (DeepSeek, Moonshot/Kimi, ...) reject continuation
+/// requests that drop the assistant `reasoning_content`; on the native
+/// Responses side DeepSeek has the same requirement for `reasoning` items'
+/// `reasoning_text` parts. The proxy must not strip those arrays before a
+/// request reaches such an upstream, so the Responses-input sanitizer skips
+/// providers that match here (the reactive retry remains the safety net for
+/// any strict gateway in this family).
+pub fn provider_requires_reasoning_content_roundtrip(provider: &Provider, body: &Value) -> bool {
+    if body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(is_reasoning_vendor_identifier)
+    {
+        return true;
+    }
+
+    let settings = &provider.settings_config;
+    // Codex providers keep their upstream URL inside the `config` TOML (e.g.
+    // the DeepSeek preset's `[model_providers.custom] base_url`). Bind the
+    // extracted `String` so the borrowed `&str` outlives the array below.
+    let config_base_url = settings
+        .get("config")
+        .and_then(|v| v.as_str())
+        .and_then(crate::codex_config::extract_codex_base_url);
+    let base_urls = [
+        settings
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(|v| v.as_str()),
+        settings.get("base_url").and_then(|v| v.as_str()),
+        settings.get("baseURL").and_then(|v| v.as_str()),
+        settings.get("apiEndpoint").and_then(|v| v.as_str()),
+        config_base_url.as_deref(),
+    ];
+
+    let requires_roundtrip = base_urls
+        .into_iter()
+        .flatten()
+        .any(is_reasoning_vendor_identifier);
+    requires_roundtrip
+}
+
 pub fn transform_claude_request_for_api_format(
     body: serde_json::Value,
     provider: &Provider,
@@ -2182,6 +2227,39 @@ mod tests {
         let msg = &transformed["messages"][0];
         assert_eq!(msg["reasoning_content"], "I should call the tool.");
         assert!(msg.get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn reasoning_roundtrip_detects_model_name_hint() {
+        let provider = create_provider(json!({}));
+        let body = json!({ "model": "deepseek-v4-flash" });
+        assert!(provider_requires_reasoning_content_roundtrip(
+            &provider, &body
+        ));
+    }
+
+    #[test]
+    fn reasoning_roundtrip_detects_codex_toml_base_url() {
+        // Codex providers keep their upstream URL inside the `config` TOML,
+        // e.g. the DeepSeek preset.
+        let provider = create_provider(json!({
+            "config": "model_provider = \"custom\"\nmodel = \"deepseek-v4-flash\"\n\n[model_providers.custom]\nname = \"DeepSeek\"\nbase_url = \"https://api.deepseek.com/v1\"\nwire_api = \"responses\"\n"
+        }));
+        let body = json!({ "model": "deepseek-v4-flash" });
+        assert!(provider_requires_reasoning_content_roundtrip(
+            &provider, &body
+        ));
+    }
+
+    #[test]
+    fn reasoning_roundtrip_false_for_strict_gateways() {
+        let provider = create_provider(json!({
+            "config": "model_provider = \"custom\"\nmodel = \"gpt-5.6-sol\"\n\n[model_providers.custom]\nname = \"My Codex\"\nbase_url = \"https://faroapi.com/v1\"\nwire_api = \"responses\"\n"
+        }));
+        let body = json!({ "model": "gpt-5.6-sol" });
+        assert!(!provider_requires_reasoning_content_roundtrip(
+            &provider, &body
+        ));
     }
 
     #[test]

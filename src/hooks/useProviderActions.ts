@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { providersApi, settingsApi, openclawApi, type AppId } from "@/lib/api";
+import { proxyApi } from "@/lib/api/proxy";
 import type {
   Provider,
   UsageScript,
@@ -16,6 +17,7 @@ import {
   useUpdateProviderMutation,
   useDeleteProviderMutation,
   useSwitchProviderMutation,
+  proxyKeys,
 } from "@/lib/query";
 import { usageKeys } from "@/lib/query/usage";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -26,6 +28,7 @@ import {
   isCodexChatWireApi,
 } from "@/utils/providerConfigUtils";
 import {
+  providerHasCodexModelAggregation,
   providerNeedsRouting,
   supportsOfficialProxyTakeover,
 } from "@/utils/providerCapabilities";
@@ -191,6 +194,8 @@ export function useProviderActions(
         activeApp === "claude-desktop"
           ? isProxyRunning === true
           : isProxyTakeover === true;
+      const autoEnableCodexAggregation =
+        !routingReady && providerHasCodexModelAggregation(activeApp, provider);
 
       // Determine why this provider requires the proxy.
       let proxyRequiredReason: string | null = null;
@@ -290,6 +295,32 @@ export function useProviderActions(
         const result = await switchProviderMutation.mutateAsync(provider.id);
         await syncClaudePlugin(provider);
 
+        if (autoEnableCodexAggregation) {
+          try {
+            // Enabling takeover also starts the local proxy. Keep this internal so
+            // model aggregation behaves like a normal provider model mapping.
+            await proxyApi.setProxyTakeoverForApp("codex", true);
+            await Promise.all([
+              queryClient.invalidateQueries({ queryKey: proxyKeys.status }),
+              queryClient.invalidateQueries({
+                queryKey: proxyKeys.takeoverStatus,
+              }),
+            ]);
+          } catch (error) {
+            const detail =
+              extractErrorMessage(error) ||
+              t("common.unknown", { defaultValue: "Unknown error" });
+            toast.error(
+              t("notifications.codexAggregationAutoEnableFailed", {
+                detail,
+                defaultValue: `Model mapping was switched, but local forwarding could not be enabled automatically: ${detail}`,
+              }),
+              { duration: 6000 },
+            );
+            return;
+          }
+        }
+
         // Show backfill warning if present
         if (result?.warnings?.length) {
           toast.warning(
@@ -338,6 +369,7 @@ export function useProviderActions(
       activeApp,
       isProxyRunning,
       isProxyTakeover,
+      queryClient,
       t,
     ],
   );

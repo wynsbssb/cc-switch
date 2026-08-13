@@ -9,7 +9,6 @@ mod codex_desktop_conversations;
 mod codex_desktop_statsig;
 mod codex_history_migration;
 mod codex_state_db;
-mod codex_unified_storage;
 mod commands;
 mod config;
 mod database;
@@ -847,17 +846,6 @@ pub fn run() {
                     }
                 });
             }
-            {
-                // 统一会话存储自愈：开关开着但目录链接丢失（误删 / 杀软清理）
-                // 时自动重建，并把残留的 ~/.codex 会话目录迁入统一目录。
-                tauri::async_runtime::spawn_blocking(|| {
-                    if let Err(e) = crate::codex_unified_storage::ensure_active_on_startup() {
-                        log::warn!("Codex unified session storage ensure failed: {e}");
-                    }
-                });
-            }
-
-
             // 老用户 / 已确认的路径由 `fresh_install_at_startup` 自行拦截，这里不做写入。
             // 字段只由前端在用户点击"我知道了"时 save_settings 回写，语义是"用户显式确认过"。
             if !first_run_already_confirmed && fresh_install_at_startup {
@@ -1422,9 +1410,6 @@ pub fn run() {
             commands::has_codex_desktop_conversations_backup,
             commands::snapshot_codex_desktop_conversations,
             commands::restore_codex_desktop_conversations,
-            commands::enable_codex_unified_storage,
-            commands::disable_codex_unified_storage,
-            commands::get_codex_unified_storage_status,
             commands::get_rectifier_config,
             commands::set_rectifier_config,
             commands::get_optimizer_config,
@@ -1891,14 +1876,37 @@ pub fn run() {
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
     // 退出前再快照一次 Codex 桌面端对话数据：这是 cc-switch 关闭前最后一次
     // 保证，用户之后直接用 ChatGPT 账号登录也不丢对话数据。
-    if let Err(e) = tauri::async_runtime::spawn_blocking(|| {
-        crate::codex_desktop_conversations::snapshot_codex_desktop_conversations_if_changed()
-    })
+    //
+    // 快照是 best-effort：会话数据多时全量复制可达数百 MB / 数秒，不能让它
+    // 阻塞用户退出。这里加一个短时限，超时则放弃本次快照继续退出；启动和
+    // 每次切换提供商时已另行快照，退出快照只是兜底抓取最后一次增量。
+    match tokio::time::timeout(
+        EXIT_SNAPSHOT_TIMEOUT,
+        tauri::async_runtime::spawn_blocking(|| {
+            crate::codex_desktop_conversations::snapshot_codex_desktop_conversations_if_changed()
+        }),
+    )
     .await
     {
-        log::warn!("Codex desktop conversation snapshot on exit failed: {e}");
-    } else {
-        log::info!("Codex desktop conversation snapshot on exit completed");
+        Ok(Ok(Ok(outcome))) => {
+            if let Some(reason) = outcome.skipped_reason {
+                log::debug!("Codex desktop conversation snapshot on exit skipped: {reason}");
+            } else {
+                log::info!("Codex desktop conversation snapshot on exit completed");
+            }
+        }
+        Ok(Ok(Err(e))) => {
+            log::warn!("Codex desktop conversation snapshot on exit failed: {e}");
+        }
+        Ok(Err(e)) => {
+            log::warn!("Codex desktop conversation snapshot task panicked: {e}");
+        }
+        Err(_) => {
+            log::warn!(
+                "Codex desktop conversation snapshot on exit timed out after {}ms; exiting anyway",
+                EXIT_SNAPSHOT_TIMEOUT.as_millis()
+            );
+        }
     }
 
     if let Some(state) = app_handle.try_state::<store::AppState>() {
@@ -2262,6 +2270,12 @@ fn classify_exit_request(code: Option<i32>) -> ExitRequestAction {
 fn window_state_flags() -> StateFlags {
     StateFlags::POSITION | StateFlags::SIZE | StateFlags::MAXIMIZED
 }
+
+/// 退出时 Codex 桌面会话快照的最长等待时间。
+///
+/// 数据量大时全量复制可能耗时数秒；退出体验优先，超时即放弃本次兜底快照，
+/// 已有快照（启动 / 切换提供商时）仍然保证数据可恢复。
+const EXIT_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 当前应用的退出路径会拦截 `ExitRequested` 并最终直接 `std::process::exit(0)`，
 /// 这里需要在真正结束进程前手动落盘，避免 window-state 插件的默认退出钩子被绕过。

@@ -12,10 +12,15 @@
 //! `~/.cc-switch/backups/codex-desktop-conversations/<时间戳>/`，并提供
 //! 一键恢复，保证即使 cc-switch 已退出，对话数据也永远可还原、不真正丢失。
 //!
+//! 快照是增量的：与上一份快照相比未变化的会话文件用硬链接复用（零数据
+//! 写入），只把新增 / 变更的文件真正写盘，避免每次切换 / 退出都重复写
+//! 数百 MB 数据、无谓磨损磁盘。
+//!
 //! 快照与恢复都是 best-effort：任何单项失败只记录日志、不阻断整体流程，
 //! 也不会破坏 Codex 配置目录里的既有文件（恢复前会把现状先移入
 //! `pre-restore-*` 目录）。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,6 +36,9 @@ use crate::error::AppError;
 const CODEX_DESKTOP_CONVERSATIONS_BACKUP_NAME: &str = "codex-desktop-conversations";
 /// 恢复前把现状临时移入的前缀目录名。
 const CODEX_DESKTOP_CONVERSATIONS_PRE_RESTORE_PREFIX: &str = "pre-restore";
+/// 快照写入过程中使用的临时目录前缀；完成后 rename 为正式时间戳目录。
+/// 退出路径上的快照有超时上限，进程可能被强杀，临时目录可能残留。
+const CODEX_DESKTOP_CONVERSATIONS_IN_PROGRESS_PREFIX: &str = "in-progress";
 /// 保留的快照代际数（超出后按时间清理最旧的）。
 const CODEX_DESKTOP_CONVERSATIONS_MAX_KEEP: usize = 10;
 
@@ -91,8 +99,8 @@ fn write_snapshot_meta(
         "stateDbs": outcome.state_dbs,
         "fingerprint": fingerprint,
     });
-    let bytes = serde_json::to_vec_pretty(&payload)
-        .map_err(|e| AppError::JsonSerialize { source: e })?;
+    let bytes =
+        serde_json::to_vec_pretty(&payload).map_err(|e| AppError::JsonSerialize { source: e })?;
     atomic_write(&snapshot_dir.join("meta.json"), &bytes)
 }
 
@@ -188,7 +196,36 @@ fn conversation_fingerprint(codex_dir: &Path, config_text: &str) -> Option<Strin
     Some(format!("{hash:016x}"))
 }
 
-/// 把 `from_dir` 下的全部文件复制到 `to_dir`（保留相对路径结构）。
+/// 快照间文件映射使用的相对路径 key（统一 `/` 分隔，跨平台稳定）。
+fn snapshot_rel_key(prefix: &str, rel: &Path) -> String {
+    format!("{prefix}/{}", rel.to_string_lossy().replace('\\', "/"))
+}
+
+/// 收集上一份快照目录的文件（相对路径 key → 大小 + mtime），用于判断
+/// 哪些文件可以硬链接复用、避免重复全量写入。
+fn collect_snapshot_file_meta(dir: &Path, prefix: &str, map: &mut HashMap<String, (u64, u64)>) {
+    if !dir.is_dir() {
+        return;
+    }
+    let mut files = Vec::new();
+    collect_files_recursive(dir, &mut files, 0, 24);
+    for file in files {
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let rel = file.strip_prefix(dir).unwrap_or(file.as_path());
+        map.insert(snapshot_rel_key(prefix, rel), (meta.len(), mtime));
+    }
+}
+
+/// 把 `from_dir` 下的全部文件真实复制到 `to_dir`（保留相对路径结构）。
+/// 用于恢复路径：快照 → Codex 目录必须落真实数据，不能复用链接。
 /// 返回复制成功的文件数。
 fn copy_dir_contents(from_dir: &Path, to_dir: &Path) -> usize {
     if !from_dir.is_dir() {
@@ -202,13 +239,96 @@ fn copy_dir_contents(from_dir: &Path, to_dir: &Path) -> usize {
         let dest = to_dir.join(rel);
         if let Some(parent) = dest.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
-                log::warn!("创建快照目录失败 {}: {e}", parent.display());
+                log::warn!("创建恢复目录失败 {}: {e}", parent.display());
                 continue;
             }
         }
         match crate::config::copy_file(&file, &dest) {
             Ok(()) => copied += 1,
-            Err(e) => log::warn!("快照复制 {} 失败: {e}", file.display()),
+            Err(e) => log::warn!("恢复复制 {} 失败: {e}", file.display()),
+        }
+    }
+    copied
+}
+
+/// 复制单个文件到快照；若与上一份快照的同路径文件（大小 + mtime）一致，
+/// 则改为硬链接复用——链接源与目标都在备份目录内，必然同卷且零数据写入，
+/// 避免每次切换 / 退出都重复把数百 MB 会话数据写一遍。链接失败退回真实复制。
+fn copy_or_link_one_file(
+    src: &Path,
+    dest: &Path,
+    prev_dir: Option<&Path>,
+    prev_files: &HashMap<String, (u64, u64)>,
+    key: &str,
+) -> bool {
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            log::warn!("创建快照目录失败 {}: {e}", parent.display());
+            return false;
+        }
+    }
+    let Ok(meta) = src.metadata() else {
+        log::warn!("读取 {} 元数据失败，跳过", src.display());
+        return false;
+    };
+    let src_mtime = meta.modified().ok();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    if let Some(prev_dir) = prev_dir {
+        if prev_files.get(key) == Some(&(meta.len(), mtime)) {
+            let prev_path = prev_dir.join(key.replace('/', std::path::MAIN_SEPARATOR_STR));
+            if fs::hard_link(&prev_path, dest).is_ok() {
+                return true;
+            }
+            log::debug!(
+                "快照硬链接复用 {} 失败，退回复制（可能跨卷）",
+                prev_path.display()
+            );
+        }
+    }
+    match crate::config::copy_file(src, dest) {
+        Ok(()) => {
+            // `fs::copy` 在 Linux/macOS 上不保留源文件 mtime；显式写回，
+            // 否则下一次快照的大小 + mtime 比对永远不相等，硬链接复用失效，
+            // 每次都会退回全量复制。
+            if let (Some(mtime), Ok(file)) = (src_mtime, fs::File::options().write(true).open(dest))
+            {
+                let _ = file.set_modified(mtime);
+            }
+            true
+        }
+        Err(e) => {
+            log::warn!("快照复制 {} 失败: {e}", src.display());
+            false
+        }
+    }
+}
+
+/// 把 `from_dir` 下的全部文件放到 `to_dir`（保留相对路径结构），未变化的
+/// 文件优先硬链接复用上一份快照。返回成功写入（复制或链接）的文件数。
+fn copy_or_link_dir_contents(
+    from_dir: &Path,
+    to_dir: &Path,
+    prev_dir: Option<&Path>,
+    prev_files: &HashMap<String, (u64, u64)>,
+    prefix: &str,
+) -> usize {
+    if !from_dir.is_dir() {
+        return 0;
+    }
+    let mut files = Vec::new();
+    collect_files_recursive(from_dir, &mut files, 0, 24);
+    let mut copied = 0;
+    for file in files {
+        let rel = file.strip_prefix(from_dir).unwrap_or(file.as_path());
+        let key = snapshot_rel_key(prefix, rel);
+        let dest = to_dir.join(rel);
+        if copy_or_link_one_file(&file, &dest, prev_dir, prev_files, &key) {
+            copied += 1;
         }
     }
     copied
@@ -229,17 +349,17 @@ pub(crate) fn snapshot_state_db(src: &Path, dest: &Path) -> bool {
     // 目标已存在时 Backup 要求为空数据库；先删掉残留。
     let _ = fs::remove_file(dest);
     let result = (|| -> Result<(), AppError> {
-        let src_conn = rusqlite::Connection::open_with_flags(
-            src,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|e| AppError::Message(format!("打开 {} 失败: {e}", src.display())))?;
+        let src_conn =
+            rusqlite::Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| AppError::Message(format!("打开 {} 失败: {e}", src.display())))?;
         let mut dest_conn = rusqlite::Connection::open(dest)
             .map_err(|e| AppError::Message(format!("创建 {} 失败: {e}", dest.display())))?;
         let backup = Backup::new(&src_conn, &mut dest_conn)
             .map_err(|e| AppError::Message(format!("初始化快照失败: {e}")))?;
+        // 每批复制 1024 页、只睡 1ms：旧实现每 5 页就睡 250ms，1.25MB 的
+        // state DB 也要等约 4 秒，纯属无谓等待；这里一次性拷完，几十毫秒内返回。
         backup
-            .run_to_completion(5, std::time::Duration::from_millis(250), None)
+            .run_to_completion(1024, std::time::Duration::from_millis(1), None)
             .map_err(|e| AppError::Message(format!("快照 {} 失败: {e}", src.display())))?;
         Ok(())
     })();
@@ -267,10 +387,7 @@ fn latest_snapshot_dir_for_current_codex_dir() -> Option<PathBuf> {
     latest_snapshot_dir_for_codex_dir(&backup_parent(), &codex_dir)
 }
 
-fn latest_snapshot_dir_for_codex_dir(
-    backup_parent: &Path,
-    codex_dir: &Path,
-) -> Option<PathBuf> {
+fn latest_snapshot_dir_for_codex_dir(backup_parent: &Path, codex_dir: &Path) -> Option<PathBuf> {
     let codex_key = canonical_dir_string(codex_dir);
     let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     let Ok(entries) = fs::read_dir(backup_parent) else {
@@ -310,6 +427,10 @@ fn prune_old_snapshots() {
     let Ok(entries) = fs::read_dir(&parent) else {
         return;
     };
+    let now = std::time::SystemTime::now();
+    // 宽限期：正常快照（启动 / 切换 / 手动）可能耗时较长，只清理明显残留的
+    // 中断快照（例如退出超时被强杀时留下的 in-progress 目录）。
+    let stale_grace = std::time::Duration::from_secs(10 * 60);
     let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -323,6 +444,18 @@ fn prune_old_snapshots() {
         let modified = fs::metadata(&path)
             .and_then(|m| m.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if name.starts_with(CODEX_DESKTOP_CONVERSATIONS_IN_PROGRESS_PREFIX) {
+            // 进程被强杀（退出快照超时等）留下的半成品目录：超过宽限期直接清理，
+            // 不参与代际计数，避免把垃圾目录算作有效快照。
+            if now.duration_since(modified).unwrap_or_default() > stale_grace {
+                if let Err(e) = fs::remove_dir_all(&path) {
+                    log::warn!("清理中断快照 {} 失败: {e}", path.display());
+                } else {
+                    log::info!("已清理中断快照 {}", path.display());
+                }
+            }
+            continue;
+        }
         dirs.push((modified, path));
     }
     dirs.sort_by(|a, b| b.0.cmp(&a.0));
@@ -379,39 +512,89 @@ fn snapshot_codex_desktop_conversations_into(
         return Ok(outcome);
     }
 
-    let snapshot_dir = backup_parent.join(timestamp_dir_name(Local::now()));
-    if let Err(e) = fs::create_dir_all(&snapshot_dir) {
-        return Err(AppError::io(&snapshot_dir, e));
+    // 上一份已完成的快照（带 meta.json 的正式目录）：未变化的会话文件用它
+    // 做硬链接复用，只有新增 / 变更的文件才真正写盘。
+    let prev_snapshot = latest_snapshot_dir_for_codex_dir(backup_parent, codex_dir);
+    let mut prev_files: HashMap<String, (u64, u64)> = HashMap::new();
+    if let Some(prev) = &prev_snapshot {
+        collect_snapshot_file_meta(&prev.join("sessions"), "sessions", &mut prev_files);
+        collect_snapshot_file_meta(
+            &prev.join("archived_sessions"),
+            "archived_sessions",
+            &mut prev_files,
+        );
+        if let Ok(meta) = prev.join("session_index.jsonl").metadata() {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            prev_files.insert("session_index.jsonl".to_string(), (meta.len(), mtime));
+        }
+        collect_snapshot_file_meta(&prev.join("state"), "state", &mut prev_files);
     }
 
-    outcome.jsonl_files =
-        copy_dir_contents(&sessions_dir, &snapshot_dir.join("sessions"));
-    outcome.archived_files =
-        copy_dir_contents(&archived_dir, &snapshot_dir.join("archived_sessions"));
+    // 先写入临时目录，全部内容（含 meta.json）就绪后再原子 rename 成最终
+    // 时间戳目录。退出路径的快照带时限，进程可能被强杀：这样不会留下一个
+    // 没有 meta.json、会被 `latest_snapshot_dir_for_codex_dir` 忽略的
+    // 半成品快照目录；残留的 in-progress 目录由 prune 按时间清理。
+    let ts = timestamp_dir_name(Local::now());
+    let staging_dir = backup_parent.join(format!(
+        "{CODEX_DESKTOP_CONVERSATIONS_IN_PROGRESS_PREFIX}-{ts}"
+    ));
+    let snapshot_dir = backup_parent.join(ts);
+    if let Err(e) = fs::create_dir_all(&staging_dir) {
+        return Err(AppError::io(&staging_dir, e));
+    }
+
+    outcome.jsonl_files = copy_or_link_dir_contents(
+        &sessions_dir,
+        &staging_dir.join("sessions"),
+        prev_snapshot.as_deref(),
+        &prev_files,
+        "sessions",
+    );
+    outcome.archived_files = copy_or_link_dir_contents(
+        &archived_dir,
+        &staging_dir.join("archived_sessions"),
+        prev_snapshot.as_deref(),
+        &prev_files,
+        "archived_sessions",
+    );
     if session_index.exists() {
-        match crate::config::copy_file(&session_index, &snapshot_dir.join("session_index.jsonl")) {
-            Ok(()) => outcome.jsonl_files += 1,
-            Err(e) => log::warn!("快照 session_index.jsonl 失败: {e}"),
+        if copy_or_link_one_file(
+            &session_index,
+            &staging_dir.join("session_index.jsonl"),
+            prev_snapshot.as_deref(),
+            &prev_files,
+            "session_index.jsonl",
+        ) {
+            outcome.jsonl_files += 1;
         }
     }
     for db in state_dbs {
         let file_name = db.file_name().unwrap_or_default();
-        if snapshot_state_db(&db, &snapshot_dir.join("state").join(file_name)) {
+        if snapshot_state_db(&db, &staging_dir.join("state").join(file_name)) {
             outcome.state_dbs += 1;
         }
     }
 
     if outcome.jsonl_files == 0 && outcome.archived_files == 0 && outcome.state_dbs == 0 {
         // 没有实际内容被复制，删掉空目录，避免产生无意义的代际。
-        let _ = fs::remove_dir_all(&snapshot_dir);
+        let _ = fs::remove_dir_all(&staging_dir);
         outcome.skipped_reason = Some("no_conversation_data".to_string());
         return Ok(outcome);
     }
 
     let fingerprint = conversation_fingerprint(codex_dir, &config_text);
-    if let Err(e) = write_snapshot_meta(&snapshot_dir, codex_dir, &outcome, fingerprint.as_deref())
-    {
+    if let Err(e) = write_snapshot_meta(&staging_dir, codex_dir, &outcome, fingerprint.as_deref()) {
         log::warn!("写入对话快照 meta 失败: {e}");
+    }
+
+    if let Err(e) = fs::rename(&staging_dir, &snapshot_dir) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(AppError::io(&snapshot_dir, e));
     }
 
     outcome.snapshot_dir = Some(snapshot_dir.display().to_string());
@@ -442,12 +625,6 @@ fn latest_snapshot_fingerprint_for(codex_dir: &Path) -> Option<String> {
 pub fn snapshot_codex_desktop_conversations_if_changed(
 ) -> Result<CodexDesktopConversationsSnapshotOutcome, AppError> {
     let mut outcome = CodexDesktopConversationsSnapshotOutcome::default();
-    // 统一存储激活时，会话数据已物理存放于 ~/.cc-switch/codex，路由切换
-    // 只改 config/auth，数据永不被触碰 —— 无需再快照。
-    if crate::codex_unified_storage::is_active() {
-        outcome.skipped_reason = Some("unified_storage".to_string());
-        return Ok(outcome);
-    }
     if !crate::settings::backup_codex_desktop_conversations() {
         outcome.skipped_reason = Some("toggle_off".to_string());
         return Ok(outcome);
@@ -578,10 +755,8 @@ fn restore_codex_desktop_conversations_from(
     }
 
     // 会话 rollout 文件。
-    outcome.jsonl_files = copy_dir_contents(
-        &snapshot_dir.join("sessions"),
-        &codex_dir.join("sessions"),
-    );
+    outcome.jsonl_files =
+        copy_dir_contents(&snapshot_dir.join("sessions"), &codex_dir.join("sessions"));
     // 归档会话。
     outcome.archived_files = copy_dir_contents(
         &snapshot_dir.join("archived_sessions"),
@@ -637,9 +812,19 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         std::env::set_var("CC_SWITCH_TEST_HOME", temp.path());
         let codex_dir = temp.path().join(".codex");
-        let backup_parent = temp.path().join(".cc-switch").join("backups").join("codex-desktop-conversations");
-        fs::create_dir_all(codex_dir.join("sessions").join("2026").join("08").join("13"))
-            .expect("create sessions");
+        let backup_parent = temp
+            .path()
+            .join(".cc-switch")
+            .join("backups")
+            .join("codex-desktop-conversations");
+        fs::create_dir_all(
+            codex_dir
+                .join("sessions")
+                .join("2026")
+                .join("08")
+                .join("13"),
+        )
+        .expect("create sessions");
         fs::write(
             codex_dir
                 .join("sessions")
@@ -656,13 +841,9 @@ mod tests {
         )
         .expect("write index");
         fs::create_dir_all(codex_dir.join("archived_sessions")).expect("archived dir");
-        fs::write(
-            codex_dir.join("archived_sessions").join("old.jsonl"),
-            "{}",
-        )
-        .expect("write archived");
-        let conn =
-            rusqlite::Connection::open(codex_dir.join("state_5.sqlite")).expect("open db");
+        fs::write(codex_dir.join("archived_sessions").join("old.jsonl"), "{}")
+            .expect("write archived");
+        let conn = rusqlite::Connection::open(codex_dir.join("state_5.sqlite")).expect("open db");
         conn.execute_batch(
             "CREATE TABLE threads (id TEXT PRIMARY KEY); INSERT INTO threads VALUES ('t1');",
         )
@@ -673,8 +854,8 @@ mod tests {
     #[test]
     fn snapshot_and_restore_round_trip() {
         let (_temp, codex_dir, backup_parent) = setup();
-        let outcome =
-            snapshot_codex_desktop_conversations_into(&codex_dir, &backup_parent).expect("snapshot");
+        let outcome = snapshot_codex_desktop_conversations_into(&codex_dir, &backup_parent)
+            .expect("snapshot");
         assert!(outcome.skipped_reason.is_none());
         assert!(outcome.jsonl_files >= 2); // session + session_index
         assert_eq!(outcome.archived_files, 1);
@@ -686,8 +867,8 @@ mod tests {
         fs::remove_file(codex_dir.join("session_index.jsonl")).expect("remove index");
         fs::remove_file(codex_dir.join("state_5.sqlite")).expect("remove db");
 
-        let latest = latest_snapshot_dir_for_codex_dir(&backup_parent, &codex_dir)
-            .expect("latest snapshot");
+        let latest =
+            latest_snapshot_dir_for_codex_dir(&backup_parent, &codex_dir).expect("latest snapshot");
         let restored =
             restore_codex_desktop_conversations_from(&codex_dir, &latest, &backup_parent)
                 .expect("restore");
@@ -726,8 +907,8 @@ mod tests {
         let codex_dir = temp.path().join(".codex");
         fs::create_dir_all(&codex_dir).expect("create codex");
         let backup_parent = temp.path().join("backups");
-        let outcome =
-            snapshot_codex_desktop_conversations_into(&codex_dir, &backup_parent).expect("snapshot");
+        let outcome = snapshot_codex_desktop_conversations_into(&codex_dir, &backup_parent)
+            .expect("snapshot");
         assert_eq!(
             outcome.skipped_reason.as_deref(),
             Some("no_conversation_data")
@@ -739,8 +920,7 @@ mod tests {
     fn latest_snapshot_only_matches_same_codex_dir() {
         let (_temp, codex_dir, backup_parent) = setup();
         snapshot_codex_desktop_conversations_into(&codex_dir, &backup_parent).expect("snapshot");
-        let latest =
-            latest_snapshot_dir_for_codex_dir(&backup_parent, &codex_dir).expect("latest");
+        let latest = latest_snapshot_dir_for_codex_dir(&backup_parent, &codex_dir).expect("latest");
         assert!(latest.join("meta.json").exists());
 
         // 另一个目录不应命中。
@@ -759,8 +939,7 @@ mod tests {
         assert!(first.snapshot_dir.is_some());
 
         // 数据未变化 -> 跳过，不产生新快照。
-        let second =
-            snapshot_codex_desktop_conversations_if_changed().expect("second snapshot");
+        let second = snapshot_codex_desktop_conversations_if_changed().expect("second snapshot");
         assert_eq!(second.skipped_reason.as_deref(), Some("unchanged"));
 
         // 修改会话文件 -> 指纹变化 -> 再次快照。
@@ -778,6 +957,97 @@ mod tests {
         let third = snapshot_codex_desktop_conversations_if_changed().expect("third snapshot");
         assert!(third.skipped_reason.is_none());
         assert!(third.jsonl_files >= 2);
+
+        std::env::remove_var("CC_SWITCH_TEST_HOME");
+    }
+
+    #[test]
+    fn snapshot_commits_atomically_without_leaving_staging_dir() {
+        let (_temp, codex_dir, backup_parent) = setup();
+        let outcome = snapshot_codex_desktop_conversations_into(&codex_dir, &backup_parent)
+            .expect("snapshot");
+        let snapshot_dir = PathBuf::from(outcome.snapshot_dir.expect("snapshot dir"));
+        assert!(snapshot_dir.join("meta.json").exists());
+
+        // 成功落盘后不应残留 in-progress 临时目录。
+        let leftovers: Vec<_> = fs::read_dir(&backup_parent)
+            .expect("read backup parent")
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(CODEX_DESKTOP_CONVERSATIONS_IN_PROGRESS_PREFIX)
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging dir left behind: {leftovers:?}"
+        );
+        std::env::remove_var("CC_SWITCH_TEST_HOME");
+    }
+
+    #[test]
+    fn incremental_snapshot_reuses_unchanged_files_and_copies_deltas() {
+        let (_temp, codex_dir, backup_parent) = setup();
+        let first = snapshot_codex_desktop_conversations_into(&codex_dir, &backup_parent)
+            .expect("first snapshot");
+        let first_dir = PathBuf::from(first.snapshot_dir.expect("first snapshot dir"));
+
+        // 新增一个会话文件，模拟数据增量。
+        let new_session = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("14")
+            .join("rollout-new.jsonl");
+        fs::create_dir_all(new_session.parent().expect("parent")).expect("create dir");
+        fs::write(&new_session, "{\"type\":\"session_meta\",\"payload\":{}}\n")
+            .expect("write new session");
+
+        let second = snapshot_codex_desktop_conversations_into(&codex_dir, &backup_parent)
+            .expect("second snapshot");
+        let second_dir = PathBuf::from(second.snapshot_dir.expect("second snapshot dir"));
+
+        // 新文件被写入，上一份快照保持原样（增量，不覆盖历史）。
+        assert!(second_dir
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("14")
+            .join("rollout-new.jsonl")
+            .exists());
+        assert!(!first_dir
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("14")
+            .join("rollout-new.jsonl")
+            .exists());
+
+        // 未变化的文件内容一致。
+        let old_rel = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("13")
+            .join("rollout-test.jsonl");
+        let old_rel_snapshot = PathBuf::from("sessions/2026/08/13/rollout-test.jsonl");
+        assert_eq!(
+            fs::read(&old_rel).expect("live old"),
+            fs::read(first_dir.join(&old_rel_snapshot)).expect("first old"),
+        );
+        assert_eq!(
+            fs::read(&old_rel).expect("live old"),
+            fs::read(second_dir.join(&old_rel_snapshot)).expect("second old"),
+        );
+        // 复制后目标文件应保留源 mtime，保证下一轮能命中硬链接复用。
+        assert_eq!(
+            fs::metadata(&old_rel).expect("live meta").modified().ok(),
+            fs::metadata(second_dir.join(&old_rel_snapshot))
+                .expect("snapshot meta")
+                .modified()
+                .ok(),
+        );
 
         std::env::remove_var("CC_SWITCH_TEST_HOME");
     }

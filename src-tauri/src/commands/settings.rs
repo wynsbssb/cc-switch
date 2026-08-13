@@ -222,33 +222,6 @@ pub async fn restore_codex_desktop_conversations(
     Ok(outcome)
 }
 
-/// 启用 Codex 会话/状态数据统一存放（迁移 + 建目录链接 + 注入 sqlite_home）。
-#[tauri::command]
-pub async fn enable_codex_unified_storage(
-) -> Result<crate::codex_unified_storage::CodexUnifiedStorageOutcome, String> {
-    tauri::async_runtime::spawn_blocking(crate::codex_unified_storage::enable)
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
-}
-
-/// 关闭 Codex 会话/状态数据统一存放（数据移回 ~/.codex + 撤链接）。
-#[tauri::command]
-pub async fn disable_codex_unified_storage(
-) -> Result<crate::codex_unified_storage::CodexUnifiedStorageOutcome, String> {
-    tauri::async_runtime::spawn_blocking(crate::codex_unified_storage::disable)
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
-}
-
-/// 查询 Codex 统一存储状态（开关、链接、各路径）。
-#[tauri::command]
-pub fn get_codex_unified_storage_status(
-) -> crate::codex_unified_storage::CodexUnifiedStorageOutcome {
-    crate::codex_unified_storage::status()
-}
-
 /// 重启应用程序（当 app_config_dir 变更后使用）
 #[tauri::command]
 pub async fn restart_app(app: AppHandle) -> Result<bool, String> {

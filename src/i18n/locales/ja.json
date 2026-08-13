@@ -310,16 +310,6 @@
       "restoreBackup": "オンにした際に移行した公式セッションを公式履歴へ復元する（バックアップから正確に復元）",
       "confirm": "オフにする"
     },
-    "unifyCodexStorage": {
-      "title": "セッションデータの一元保存を有効化",
-      "message": "Codex のセッション・状態データを ~/.cc-switch/codex に一元化します（sessions フォルダは ~/.codex からディレクトリリンクで透過的に参照され、状態 DB は config の sqlite_home でリダイレクトされます）。以降、プロバイダ/ルートの切り替えでは config と auth だけが書き換わり、セッションデータのコピーは発生しないため切り替えが高速になります。\n\n既存の ~/.codex の sessions・archived_sessions・state_5.sqlite は一元ディレクトリへ移動されます。可能であれば先に ChatGPT/Codex デスクトップを終了してください。",
-      "confirm": "移行して有効化"
-    },
-    "unifyCodexStorageOff": {
-      "title": "セッションデータの一元保存を無効化",
-      "message": "無効化すると、一元ディレクトリのセッション・状態データは ~/.codex へ戻され、ディレクトリリンクは削除されます。ChatGPT/Codex デスクトップが実行中だとロックされたファイルの移動に失敗する場合があります。先にデスクトップを終了してください。",
-      "confirm": "戻して無効化"
-    },
     "restoreCodexDesktopConversations": {
       "title": "デスクトップの会話データを復元",
       "message": "最新の自動バックアップで現在のローカル会話（セッションファイル・セッション索引・状態 DB）を上書きします。現在のデータは先に ~/.cc-switch/backups の pre-restore フォルダへ退避されるため、操作は元に戻せます。\n\n状態 DB がロックされないよう、先に ChatGPT デスクトップを終了することをお勧めします。",
@@ -725,12 +715,6 @@
     "restoreCodexDesktopConversationsCompleted": "バックアップからデスクトップの会話データを復元しました（{{files}} 件のセッションファイル、{{dbs}} 件の状態 DB）",
     "restoreCodexDesktopConversationsFailed": "デスクトップの会話データの復元に失敗しました",
     "restoreCodexDesktopConversationsNothing": "現在の Codex ディレクトリに復元可能なバックアップがありません",
-    "unifyCodexStorage": "セッションデータの一元保存",
-    "unifyCodexStorageDescription": "Codex のセッション・状態データを ~/.cc-switch/codex に一元化します（ディレクトリリンク + sqlite_home）。ルート切り替えでは設定のみ書き換え、セッションのコピーは発生しないため高速化し、データも切り替えの影響を受けません。",
-    "unifyCodexStorageEnabled": "セッションデータの一元保存を有効化しました。ルート切り替えでセッションをコピーしません",
-    "unifyCodexStorageEnableFailed": "セッションデータの一元保存の有効化に失敗しました",
-    "unifyCodexStorageDisabled": "セッションデータの一元保存を無効化し、データを ~/.codex へ戻しました",
-    "unifyCodexStorageDisableFailed": "セッションデータの一元保存の無効化に失敗しました。ChatGPT/Codex デスクトップを終了して再試行してください",
     "appVisibility": {
       "title": "ホームページ表示",
       "description": "ホームページに表示するアプリを選択",
@@ -1408,11 +1392,11 @@
     "catalogColumnDisplay": "メニュー表示名",
     "catalogColumnModel": "実際のリクエストモデル",
     "catalogColumnContext": "コンテキストウィンドウ",
-    "customModelsTitle": "カスタムモデル一覧",
+    "customModelsTitle": "プロバイダー別モデルマッピング",
     "aggregationLabel": "モデル集約",
-    "aggregationHint": "有効にすると、他のプロバイダーのモデルを Codex に集約できます（ローカルルーティング/プロキシを有効にする必要があります）。無効の場合は通常の公式ログインとして動作します。",
-    "customModelsHint": "これらのモデルは Codex のモデル一覧に表示され、選択するとローカルプロキシがリクエストをバインド先のプロバイダーへ転送します（必要に応じてプロトコル変換、公式ログインは維持）。",
-    "customModelsHintAggregate": "プロバイダーを選択して実際のリクエストモデルを入力すると、CC Switch が Codex 表示モデルを自動生成してそのプロバイダーへマッピングします。コンテキストウィンドウは空欄で 128k になります。",
+    "aggregationHint": "他のプロバイダーのモデルを Codex のモデルマッピングに追加します。この設定へ切り替えると必要なローカル転送が自動的に有効になるため、ルーティングを別途有効にする必要はありません。無効の場合は通常の公式ログインとして動作します。",
+    "customModelsHint": "プロバイダーごとに Codex メニューのモデルを設定します。同じプロバイダーに複数のモデルマッピングを追加でき、選択したモデルはローカルプロキシからそのプロバイダーへ転送されます。",
+    "customModelsHintAggregate": "プロバイダーごとにモデルをマッピングします。同じプロバイダーに複数のモデルを追加でき、コンテキストウィンドウは空欄で 128k になります。",
     "enableOfficialLoginLabel": "公式ログインを有効化",
     "enableOfficialLoginHintOn": "公式モデルは ChatGPT アカウントログインを使用します。以下のカスタムモデルは各プロバイダーの認証情報を使用します。",
     "enableOfficialLoginHintOff": "ログイン不要：以下のプロバイダー設定に基づくモデルを一覧表示し、モデルごとにルーティングします。",
@@ -1440,7 +1424,13 @@
     "reasoningGroupTitle": "思考能力",
     "reasoningSectionHint": "プリセットの供給元は自動的に設定され、カスタム供給元は名前/URL から自動推論されます。自動識別が正しくない場合のみ手動で上書きしてください。",
     "advancedSectionHint": "上流フォーマット、モデルマッピング、思考能力、カスタム User-Agent の設定を含みます。Chat Completions プロトコルを使用するプロバイダーはルーティング引き継ぎの有効化が必要です。",
-    "noCommonConfigToApply": "共通設定スニペットが空か、書き込む内容がありません"
+    "noCommonConfigToApply": "共通設定スニペットが空か、書き込む内容がありません",
+    "addCustomProvider": "プロバイダーを追加",
+    "addCustomModelMapping": "モデルマッピングを追加",
+    "removeCustomProvider": "プロバイダーマッピングを削除",
+    "selectProviderBeforeAddingModel": "先にプロバイダーを選択してください",
+    "providerModelCount": "{{provider}}：{{count}} 件のモデルマッピング",
+    "autoAddProviderModels": "このプロバイダーの全モデルを自動追加"
   },
   "geminiConfig": {
     "envFile": "環境変数 (.env)",

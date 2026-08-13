@@ -18,8 +18,6 @@ import {
 } from "@/components/ui/collapsible";
 import { toast } from "sonner";
 import {
-  ArrowDown,
-  ArrowUp,
   ChevronDown,
   ChevronRight,
   Download,
@@ -37,6 +35,7 @@ import {
 import { XaiOAuthSection } from "./XaiOAuthSection";
 import {
   fetchModelsForConfig,
+  fetchCodexOauthModels,
   fetchXaiOauthModels,
   showFetchModelsError,
   type FetchedModel,
@@ -44,7 +43,12 @@ import {
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { cn } from "@/lib/utils";
-import { extractCodexModelName } from "@/utils/providerConfigUtils";
+import {
+  extractCodexBaseUrl,
+  extractCodexExperimentalBearerToken,
+  extractCodexModelName,
+} from "@/utils/providerConfigUtils";
+import { resolveManagedAccountId } from "@/lib/authBinding";
 import { CODEX_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
 import type {
   ClaudeApiKeyField,
@@ -198,7 +202,6 @@ type CodexCustomModelRow = Omit<
   routes: CodexCustomModelRouteRow[];
 };
 
-
 function createCustomModelRouteRow(
   seed?: Partial<CodexCustomModelRoute>,
 ): CodexCustomModelRouteRow {
@@ -212,14 +215,14 @@ function createCustomModelRouteRow(
 function customModelRoutesFromSeed(
   seed?: Partial<CodexCustomModel>,
 ): CodexCustomModelRouteRow[] {
-  const seedRoutes =
-    seed?.routes && seed.routes.length > 0
-      ? seed.routes
-      : seed?.providerId
-        ? [{ providerId: seed.providerId, upstreamModel: seed.upstreamModel }]
-        : [];
-  if (seedRoutes.length === 0) return [createCustomModelRouteRow()];
-  return seedRoutes.map((route) => createCustomModelRouteRow(route));
+  // Each aggregated model mapping belongs to one provider. When loading legacy
+  // fallback routes, migrate only the primary route so no hidden routes remain.
+  const primaryRoute =
+    seed?.routes?.[0] ??
+    (seed?.providerId
+      ? { providerId: seed.providerId, upstreamModel: seed.upstreamModel }
+      : undefined);
+  return [createCustomModelRouteRow(primaryRoute)];
 }
 
 function createCustomModelRow(
@@ -283,6 +286,87 @@ export function customRowsMatchModels(
       JSON.stringify(rowRoutes) === JSON.stringify(incomingRoutes)
     );
   });
+}
+
+/**
+ * 由供应商拉取到的模型批量生成自定义模型行（Codex 展示 ID = 模型 ID，
+ * 路由绑定到该供应商）。按 provider + upstreamModel 去重，已存在则跳过；
+ * 不同供应商暴露的相同模型 ID 保留（路由不同）。
+ */
+export function buildCustomModelAdditionsFromFetched(
+  providerId: string,
+  models: FetchedModel[],
+  existing: CodexCustomModel[],
+): CodexCustomModel[] {
+  const existingKeys = new Set(
+    existing.flatMap((row) =>
+      (row.routes ?? []).map(
+        (route) => `${route.providerId}\u0000${route.upstreamModel ?? ""}`,
+      ),
+    ),
+  );
+  return models
+    .filter((model) => !existingKeys.has(`${providerId}\u0000${model.id}`))
+    .map((model) => ({
+      model: model.id,
+      providerId,
+      upstreamModel: model.id,
+      displayName: model.id,
+      routes: [{ providerId, upstreamModel: model.id }],
+    }));
+}
+
+/**
+ * 合并某个路由行的上游模型选项：已保存目录 + 本次会话拉取到的模型，
+ * 全部归到该供应商名下一个分组，避免同一供应商的模型因来源不同
+ * （目录 ownedBy 与 /v1/models 返回的 owned_by 不一致）被下拉拆成多个分组。
+ */
+export function mergeProviderRouteModelOptions(
+  providerName: string | undefined,
+  savedModels: CodexCatalogModel[],
+  fetchedModels: FetchedModel[],
+): FetchedModel[] {
+  const group = providerName?.trim() || "Catalog";
+  const saved = savedModels
+    .filter((model) => typeof model.model === "string" && model.model.trim())
+    .map((model) => ({ id: model.model, ownedBy: group }));
+  const seen = new Set(saved.map((model) => model.id));
+  const fetched = fetchedModels
+    .filter((model) => !seen.has(model.id))
+    .map((model) => ({ id: model.id, ownedBy: group }));
+  return [...saved, ...fetched];
+}
+
+export interface CodexCustomModelProviderGroup<T extends CodexCustomModel> {
+  key: string;
+  providerId: string;
+  rows: Array<{ row: T; index: number }>;
+}
+
+/**
+ * Group model mappings by their primary provider. Blank provider drafts remain
+ * separate groups, while the persisted data stays a flat array for compatibility.
+ */
+export function groupCodexCustomModelsByProvider<T extends CodexCustomModel>(
+  rows: readonly T[],
+): CodexCustomModelProviderGroup<T>[] {
+  const groups: CodexCustomModelProviderGroup<T>[] = [];
+  const positions = new Map<string, number>();
+
+  rows.forEach((row, index) => {
+    const providerId =
+      row.routes?.[0]?.providerId?.trim() || row.providerId?.trim() || "";
+    const key = providerId ? `provider:${providerId}` : `empty:${index}`;
+    const existingIndex = positions.get(key);
+    if (existingIndex === undefined) {
+      positions.set(key, groups.length);
+      groups.push({ key, providerId, rows: [{ row, index }] });
+      return;
+    }
+    groups[existingIndex].rows.push({ row, index });
+  });
+
+  return groups;
 }
 
 export function CodexFormFields({
@@ -402,7 +486,6 @@ export function CodexFormFields({
     }
   }, [hasAnyAdvancedValue, isXaiOauthPreset]);
 
-
   const [catalogRows, setCatalogRows] = useState<CodexCatalogRow[]>(() =>
     catalogModels.map((m) => createCatalogRow(m)),
   );
@@ -438,6 +521,10 @@ export function CodexFormFields({
   const [customRows, setCustomRows] = useState<CodexCustomModelRow[]>(() =>
     codexCustomModels.map((m) => createCustomModelRow(m)),
   );
+  const customProviderGroups = useMemo(
+    () => groupCodexCustomModelsByProvider(customRows),
+    [customRows],
+  );
 
   const lastSentCustomModelsRef = useRef<CodexCustomModel[]>(codexCustomModels);
 
@@ -451,17 +538,19 @@ export function CodexFormFields({
 
   useEffect(() => {
     if (!onCodexCustomModelsChange) return;
-    const next: CodexCustomModel[] = customRows.map(
-      ({ rowId: _rowId, routes, ...rest }) => ({
+    // Persist rows grouped by provider so each provider heading stays adjacent to its models.
+    const next: CodexCustomModel[] = customProviderGroups.flatMap((group) =>
+      group.rows.map(({ row: { rowId: _rowId, routes, ...rest } }) => ({
         ...rest,
-        routes: routes.map(({ routeId: _routeId, ...route }) => route),
-      }),
+        routes: routes
+          .slice(0, 1)
+          .map(({ routeId: _routeId, ...route }) => route),
+      })),
     );
-    if (customRowsMatchModels(customRows, lastSentCustomModelsRef.current))
-      return;
+    if (customRowsMatchModels(next, lastSentCustomModelsRef.current)) return;
     lastSentCustomModelsRef.current = next;
     onCodexCustomModelsChange(next);
-  }, [customRows, onCodexCustomModelsChange]);
+  }, [customProviderGroups, onCodexCustomModelsChange]);
 
   const handleAddCustomModelRow = useCallback(() => {
     if (!onCodexCustomModelsChange) return;
@@ -472,50 +561,34 @@ export function CodexFormFields({
     setCustomRows((current) => current.filter((_, i) => i !== index));
   }, []);
 
-  const handleAddCustomModelRoute = useCallback((index: number) => {
+  const handleAddCustomModelMapping = useCallback((providerId: string) => {
+    setCustomRows((current) => {
+      const nextRow = createCustomModelRow({
+        routes: [{ providerId, upstreamModel: "" }],
+      });
+      let insertAt = current.length;
+      for (let index = current.length - 1; index >= 0; index -= 1) {
+        if ((current[index].routes[0]?.providerId ?? "") === providerId) {
+          insertAt = index + 1;
+          break;
+        }
+      }
+      return [
+        ...current.slice(0, insertAt),
+        nextRow,
+        ...current.slice(insertAt),
+      ];
+    });
+  }, []);
+
+  const handleRemoveCustomProviderGroup = useCallback((rowIds: string[]) => {
+    const removed = new Set(rowIds);
     setCustomRows((current) =>
-      current.map((row, i) =>
-        i === index
-          ? { ...row, routes: [...row.routes, createCustomModelRouteRow()] }
-          : row,
-      ),
+      current.filter((row) => !removed.has(row.rowId)),
     );
   }, []);
 
-  const handleRemoveCustomModelRoute = useCallback(
-    (index: number, routeIndex: number) => {
-      setCustomRows((current) =>
-        current.map((row, i) =>
-          i === index
-            ? {
-                ...row,
-                routes: row.routes.filter((_, ri) => ri !== routeIndex),
-              }
-            : row,
-        ),
-      );
-    },
-    [],
-  );
-
-  const handleMoveCustomModelRoute = useCallback(
-    (index: number, routeIndex: number, direction: -1 | 1) => {
-      setCustomRows((current) =>
-        current.map((row, i) => {
-          if (i !== index) return row;
-          const nextIndex = routeIndex + direction;
-          if (nextIndex < 0 || nextIndex >= row.routes.length) return row;
-          const routes = [...row.routes];
-          const [moved] = routes.splice(routeIndex, 1);
-          routes.splice(nextIndex, 0, moved);
-          return { ...row, routes };
-        }),
-      );
-    },
-    [],
-  );
-
-  // ---- 自定义模型：从目标供应商的模型目录自动带出模型/上下文 ----
+  // ---- Custom models: populate model/context metadata from the selected provider ----
   const providerCatalogModels = useCallback(
     (providerId: string): CodexCatalogModel[] => {
       const provider = codexProviders.find((p) => p.id === providerId);
@@ -541,10 +614,253 @@ export function CodexFormFields({
     return map;
   }, [codexProviders, providerCatalogModels]);
 
+  // ---- 聚合行：自动获取绑定供应商的可用模型（/v1/models 或 OAuth） ----
+  // 拉取结果按供应商 id 缓存，供上游模型下拉与「自动添加」复用；不写回数据库，
+  // 只作为本次编辑会话的辅助数据。
+  const [customProviderFetchedModels, setCustomProviderFetchedModels] =
+    useState<Record<string, FetchedModel[]>>({});
+  const [fetchingCustomProviderId, setFetchingCustomProviderId] = useState<
+    string | null
+  >(null);
+
+  interface ProviderModelFetchCredentialsError {
+    missingCredentials: true;
+    missingApiKey?: boolean;
+    missingBaseUrl?: boolean;
+  }
+
+  const isMissingCredentials = (
+    err: unknown,
+  ): err is ProviderModelFetchCredentialsError =>
+    !!err &&
+    typeof err === "object" &&
+    (err as ProviderModelFetchCredentialsError).missingCredentials === true;
+
+  // 从绑定供应商自身的配置里提取端点 / 凭据并拉取模型列表：
+  // - xAI / Codex OAuth 供应商走托管账号的模型接口；
+  // - 其余按 Codex 供应商的 base_url + auth.json / experimental_bearer_token 请求。
+  const fetchProviderModels = useCallback(
+    async (provider: Provider): Promise<FetchedModel[]> => {
+      const providerType = provider.meta?.providerType;
+      if (providerType === "xai_oauth") {
+        const accountId = resolveManagedAccountId(provider.meta, "xai_oauth");
+        if (!accountId) {
+          throw {
+            missingCredentials: true,
+          } as ProviderModelFetchCredentialsError;
+        }
+        return fetchXaiOauthModels(accountId);
+      }
+      if (providerType === "codex_oauth") {
+        const accountId = resolveManagedAccountId(provider.meta, "codex_oauth");
+        if (!accountId) {
+          throw {
+            missingCredentials: true,
+          } as ProviderModelFetchCredentialsError;
+        }
+        return fetchCodexOauthModels(accountId);
+      }
+
+      const configText =
+        typeof provider.settingsConfig?.config === "string"
+          ? provider.settingsConfig.config
+          : "";
+      const baseUrl = extractCodexBaseUrl(configText)?.trim() || "";
+      const rawAuth = provider.settingsConfig?.auth;
+      let authObj: Record<string, unknown> = {};
+      if (rawAuth && typeof rawAuth === "object" && !Array.isArray(rawAuth)) {
+        authObj = rawAuth as Record<string, unknown>;
+      } else if (typeof rawAuth === "string" && rawAuth.trim()) {
+        try {
+          authObj = JSON.parse(rawAuth) as Record<string, unknown>;
+        } catch {
+          authObj = {};
+        }
+      }
+      const apiKey =
+        (typeof authObj.OPENAI_API_KEY === "string"
+          ? authObj.OPENAI_API_KEY.trim()
+          : "") ||
+        extractCodexExperimentalBearerToken(configText)?.trim() ||
+        "";
+      if (!baseUrl || !apiKey) {
+        throw {
+          missingCredentials: true,
+          missingApiKey: !apiKey,
+          missingBaseUrl: !baseUrl,
+        } as ProviderModelFetchCredentialsError;
+      }
+      return fetchModelsForConfig(
+        baseUrl,
+        apiKey,
+        provider.meta?.isFullUrl,
+        undefined,
+        provider.meta?.customUserAgent,
+      );
+    },
+    [],
+  );
+
+  // 上游模型下拉 = 供应商已保存的 modelCatalog + 本次会话拉取到的模型（去重），
+  // 全部归类到该供应商名下，避免同一供应商的模型被拆成多个分组。
+  const customFetchedModelsForProvider = useCallback(
+    (providerId: string): FetchedModel[] => {
+      const provider = codexProviders.find((p) => p.id === providerId);
+      return mergeProviderRouteModelOptions(
+        provider?.name,
+        customCatalogByProvider[providerId] ?? [],
+        customProviderFetchedModels[providerId] ?? [],
+      );
+    },
+    [codexProviders, customCatalogByProvider, customProviderFetchedModels],
+  );
+
+  const handleFetchModelsError = useCallback(
+    (err: unknown) => {
+      if (isMissingCredentials(err)) {
+        showFetchModelsError(null, t, {
+          hasApiKey: !err.missingApiKey,
+          hasBaseUrl: !err.missingBaseUrl,
+        });
+        return;
+      }
+      showFetchModelsError(err, t);
+    },
+    [t],
+  );
+
+  // 自动添加：拉取所选供应商的可用模型，批量追加为自定义模型行（按
+  // provider + upstreamModel 去重），已存在的模型跳过。
+  const handleAutoAddProviderModels = useCallback(
+    async (providerId: string) => {
+      if (!providerId) return;
+      const provider = codexProviders.find((p) => p.id === providerId);
+      if (!provider) return;
+      setFetchingCustomProviderId(providerId);
+      try {
+        const models = await fetchProviderModels(provider);
+        setCustomProviderFetchedModels((prev) => ({
+          ...prev,
+          [providerId]: models,
+        }));
+        if (models.length === 0) {
+          toast.info(
+            t("codexConfig.fetchProviderModelsEmpty", {
+              defaultValue: "该供应商没有可获取的模型",
+            }),
+          );
+          return;
+        }
+        const additions = buildCustomModelAdditionsFromFetched(
+          providerId,
+          models,
+          customRows,
+        ).map((model) => createCustomModelRow(model));
+        if (additions.length === 0) {
+          toast.info(
+            t("codexConfig.fetchProviderModelsNoNew", {
+              defaultValue: "这些模型已经在列表里了",
+            }),
+          );
+          return;
+        }
+        setCustomRows((current) => [...current, ...additions]);
+        toast.success(
+          t("codexConfig.fetchProviderModelsAdded", {
+            defaultValue: "已自动添加 {{count}} 个模型",
+            count: additions.length,
+          }),
+        );
+      } catch (err) {
+        handleFetchModelsError(err);
+      } finally {
+        setFetchingCustomProviderId(null);
+      }
+    },
+    [
+      codexProviders,
+      customRows,
+      fetchProviderModels,
+      handleFetchModelsError,
+      t,
+    ],
+  );
+
+  // 单行获取：拉取该行绑定供应商的模型并缓存；若上游模型尚未填写则自动选中第一个。
+  const handleFetchCustomRouteModels = useCallback(
+    async (index: number, routeIndex: number) => {
+      const providerId =
+        routeIndex === 0
+          ? customRows[index]?.routes[0]?.providerId
+          : customRows[index]?.routes[routeIndex]?.providerId;
+      if (!providerId) return;
+      const provider = codexProviders.find((p) => p.id === providerId);
+      if (!provider) return;
+      setFetchingCustomProviderId(providerId);
+      try {
+        const models = await fetchProviderModels(provider);
+        setCustomProviderFetchedModels((prev) => ({
+          ...prev,
+          [providerId]: models,
+        }));
+        if (models.length === 0) {
+          toast.info(
+            t("codexConfig.fetchProviderModelsEmpty", {
+              defaultValue: "该供应商没有可获取的模型",
+            }),
+          );
+          return;
+        }
+        setCustomRows((current) =>
+          current.map((row, i) => {
+            if (i !== index) return row;
+            const route = row.routes[routeIndex];
+            if (!route || route.upstreamModel) return row;
+            const first = models[0].id;
+            const routes = row.routes.map((r, ri) =>
+              ri === routeIndex ? { ...r, upstreamModel: first } : r,
+            );
+            if (routeIndex !== 0) return { ...row, routes };
+            const match = providerCatalogModels(providerId).find(
+              (m) => m.model === first,
+            );
+            return {
+              ...row,
+              model: first,
+              routes,
+              displayName: match?.displayName?.trim() || "",
+              contextWindow: match?.contextWindow ?? "",
+              supportsParallelToolCalls: match?.supportsParallelToolCalls,
+              inputModalities: match?.inputModalities
+                ? [...match.inputModalities]
+                : undefined,
+              baseInstructions: match?.baseInstructions,
+            };
+          }),
+        );
+        toast.success(
+          t("providerForm.fetchModelsSuccess", { count: models.length }),
+        );
+      } catch (err) {
+        handleFetchModelsError(err);
+      } finally {
+        setFetchingCustomProviderId(null);
+      }
+    },
+    [
+      codexProviders,
+      customRows,
+      fetchProviderModels,
+      handleFetchModelsError,
+      providerCatalogModels,
+      t,
+    ],
+  );
+
   // 选定供应商后：带出默认上游模型，并自动填 Codex 展示 ID、显示名/上下文窗口。
   // 实际请求模型变化时也同步把展示 ID 映射成该供应商模型，用户无需再选插槽。
-  const handleCustomRouteProviderChange = useCallback(
-    (index: number, routeIndex: number, providerId: string) => {
+  const handleCustomProviderGroupChange = useCallback(
+    (rowIds: string[], providerId: string) => {
       const provider = codexProviders.find((p) => p.id === providerId);
       const models = providerCatalogModels(providerId);
       const defaultUpstreamModel =
@@ -555,27 +871,35 @@ export function CodexFormFields({
         ) ||
         models[0]?.model ||
         "";
-      const match = models.find((m) => m.model === defaultUpstreamModel);
+      const targetRows = new Set(rowIds);
       setCustomRows((current) =>
-        current.map((row, i) => {
-          if (i !== index) return row;
-          const routes = row.routes.map((route, ri) =>
-            ri === routeIndex
-              ? { ...route, providerId, upstreamModel: defaultUpstreamModel }
-              : route,
-          );
-          if (routeIndex !== 0) return { ...row, routes };
+        current.map((row) => {
+          if (!targetRows.has(row.rowId)) return row;
+          const currentModel = row.routes[0]?.upstreamModel?.trim() || "";
+          const upstreamModel = currentModel || defaultUpstreamModel;
+          const match = models.find((model) => model.model === upstreamModel);
+          const primaryRoute = row.routes[0] ?? createCustomModelRouteRow();
+          const routes = [{ ...primaryRoute, providerId, upstreamModel }];
           return {
             ...row,
-            model: defaultUpstreamModel,
+            model: upstreamModel || row.model,
             routes,
-            displayName: match?.displayName?.trim() || "",
-            contextWindow: match?.contextWindow ?? "",
-            supportsParallelToolCalls: match?.supportsParallelToolCalls,
+            displayName:
+              match?.displayName?.trim() ||
+              (currentModel ? row.displayName : ""),
+            contextWindow:
+              match?.contextWindow ?? (currentModel ? row.contextWindow : ""),
+            supportsParallelToolCalls:
+              match?.supportsParallelToolCalls ??
+              (currentModel ? row.supportsParallelToolCalls : undefined),
             inputModalities: match?.inputModalities
               ? [...match.inputModalities]
-              : undefined,
-            baseInstructions: match?.baseInstructions,
+              : currentModel
+                ? row.inputModalities
+                : undefined,
+            baseInstructions:
+              match?.baseInstructions ??
+              (currentModel ? row.baseInstructions : undefined),
           };
         }),
       );
@@ -1002,7 +1326,7 @@ export function CodexFormFields({
                 <div className="flex items-center justify-between gap-3">
                   <FormLabel>
                     {t("codexConfig.customModelsTitle", {
-                      defaultValue: "自定义模型列表",
+                      defaultValue: "Provider Model Mappings",
                     })}
                   </FormLabel>
                   <Button
@@ -1013,8 +1337,8 @@ export function CodexFormFields({
                     className="h-7 gap-1"
                   >
                     <Plus className="h-3.5 w-3.5" />
-                    {t("codexConfig.addCustomModel", {
-                      defaultValue: "添加模型",
+                    {t("codexConfig.addCustomProvider", {
+                      defaultValue: "Add Provider",
                     })}
                   </Button>
                 </div>
@@ -1022,376 +1346,257 @@ export function CodexFormFields({
                   {enableOfficialLogin
                     ? t("codexConfig.customModelsHint", {
                         defaultValue:
-                          "配置后 Codex 会在模型列表里看到这些模型；选择它们时，本地代理会把请求转发到你绑定的供应商（保留官方登录，仅支持 OpenAI Responses 协议）。",
+                          "Configure Codex menu models by provider. Each provider can contain multiple model mappings.",
                       })
                     : t("codexConfig.customModelsHintAggregate", {
                         defaultValue:
-                          "选择供应商并填写实际请求模型，CC Switch 会自动生成 Codex 展示模型并映射到该供应商；上下文窗口留空按 128k 处理。",
+                          "Configure multiple model mappings under each provider; an empty context window defaults to 128k.",
                       })}
                 </p>
               </div>
 
-              {customRows.length > 0 && (
-                <div className="space-y-2">
-                  <div className="hidden grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,120px)_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
-                    <span>
-                      {t("codexConfig.customColumnProvider", {
-                        defaultValue: "供应商",
-                      })}
-                    </span>
-                    <span>
-                      {t("codexConfig.catalogColumnDisplay", {
-                        defaultValue: "菜单显示名",
-                      })}
-                    </span>
-                    <span>
-                      {t("codexConfig.catalogColumnModel", {
-                        defaultValue: "实际请求模型",
-                      })}
-                    </span>
-                    <span>
-                      {t("codexConfig.catalogColumnContext", {
-                        defaultValue: "上下文窗口",
-                      })}
-                    </span>
-                    <span />
-                  </div>
-
-                  {customRows.map((row, index) => {
-                    const primaryRoute = row.routes[0];
-                    const extraRoutes = row.routes.slice(1);
+              {customProviderGroups.length > 0 && (
+                <div className="space-y-3">
+                  {customProviderGroups.map((group) => {
+                    const rowIds = group.rows.map(({ row }) => row.rowId);
+                    const provider = codexProviders.find(
+                      (item) => item.id === group.providerId,
+                    );
                     return (
                       <div
-                        key={row.rowId}
-                        className="space-y-2 rounded-lg border border-border-default p-3"
+                        key={group.key}
+                        className="space-y-3 rounded-lg border border-border-default p-3"
                       >
-                        <div className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,120px)_36px]">
-                          <Select
-                            value={primaryRoute?.providerId ?? ""}
-                            onValueChange={(value) =>
-                              handleCustomRouteProviderChange(index, 0, value)
-                            }
-                          >
-                            <SelectTrigger
-                              className="min-w-0 select-fade-value"
-                              aria-label={t("codexConfig.customColumnProvider", {
-                                defaultValue: "供应商",
-                              })}
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                            <Select
+                              value={group.providerId}
+                              onValueChange={(value) =>
+                                handleCustomProviderGroupChange(rowIds, value)
+                              }
                             >
-                              <SelectValue
-                                placeholder={t(
-                                  "codexConfig.customProviderPlaceholder",
-                                  {
-                                    defaultValue: "选择供应商",
-                                  },
+                              <SelectTrigger
+                                className="h-9 w-auto min-w-[180px] max-w-[280px] select-fade-value"
+                                aria-label={t(
+                                  "codexConfig.customColumnProvider",
+                                  { defaultValue: "Provider" },
                                 )}
-                              />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {codexProviders
-                                .filter(
-                                  (provider) =>
-                                    !(
-                                      !enableOfficialLogin &&
-                                      provider.id ===
-                                        CODEX_OFFICIAL_PROVIDER_ID
-                                    ),
-                                )
-                                .map((provider) => (
-                                  <SelectItem
-                                    key={provider.id}
-                                    value={provider.id}
-                                  >
-                                    {provider.name}
-                                  </SelectItem>
-                                ))}
-                            </SelectContent>
-                          </Select>
-                          <Input
-                            value={row.displayName ?? ""}
-                            onChange={(event) =>
-                              handleUpdateCustomRow(index, {
-                                displayName: event.target.value,
-                              })
-                            }
-                            placeholder={t(
-                              "codexConfig.catalogDisplayNamePlaceholder",
-                              {
-                                defaultValue: "例如: DeepSeek V4 Flash",
-                              },
-                            )}
-                            aria-label={t(
-                              "codexConfig.catalogColumnDisplay",
-                              {
-                                defaultValue: "菜单显示名",
-                              },
-                            )}
-                          />
-                          <ModelInputWithFetch
-                            id={`custom-primary-model-${index}`}
-                            value={primaryRoute?.upstreamModel ?? ""}
-                            onChange={(value) =>
-                              handleCustomRouteModelChange(index, 0, value)
-                            }
-                            placeholder={t(
-                              "codexConfig.catalogColumnModel",
-                              {
-                                defaultValue: "实际请求模型",
-                              },
-                            )}
-                            fetchedModels={(
-                              customCatalogByProvider[
-                                primaryRoute?.providerId ?? ""
-                              ] ?? []
-                            ).map((model) => ({
-                              id: model.model,
-                              ownedBy:
-                                codexProviders.find(
-                                  (p) =>
-                                    p.id === primaryRoute?.providerId,
-                                )?.name ?? "Catalog",
-                            }))}
-                            isLoading={false}
-                            disabled={!primaryRoute?.providerId}
-                            ariaLabel={t("codexConfig.catalogColumnModel", {
-                              defaultValue: "实际请求模型",
-                            })}
-                          />
-                          <Input
-                            type="number"
-                            min={1}
-                            inputMode="numeric"
-                            value={row.contextWindow ?? ""}
-                            onChange={(event) =>
-                              handleUpdateCustomRow(index, {
-                                contextWindow: event.target.value.replace(
-                                  /[^\d]/g,
-                                  "",
-                                ),
-                              })
-                            }
-                            placeholder={t(
-                              "codexConfig.contextWindowPlaceholder",
-                              {
-                                defaultValue: "例如: 128000",
-                              },
-                            )}
-                            aria-label={t(
-                              "codexConfig.catalogColumnContext",
-                              {
-                                defaultValue: "上下文窗口",
-                              },
-                            )}
-                          />
+                              >
+                                <SelectValue
+                                  placeholder={t(
+                                    "codexConfig.customProviderPlaceholder",
+                                    { defaultValue: "Select provider" },
+                                  )}
+                                />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {codexProviders
+                                  .filter(
+                                    (item) =>
+                                      !(
+                                        !enableOfficialLogin &&
+                                        item.id === CODEX_OFFICIAL_PROVIDER_ID
+                                      ),
+                                  )
+                                  .map((item) => (
+                                    <SelectItem key={item.id} value={item.id}>
+                                      {item.name}
+                                    </SelectItem>
+                                  ))}
+                              </SelectContent>
+                            </Select>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-8 gap-1"
+                              onClick={() =>
+                                handleAutoAddProviderModels(group.providerId)
+                              }
+                              disabled={
+                                !group.providerId ||
+                                fetchingCustomProviderId !== null
+                              }
+                            >
+                              {fetchingCustomProviderId === group.providerId ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Download className="h-3.5 w-3.5" />
+                              )}
+                              {t("codexConfig.autoAddProviderModels", {
+                                defaultValue: "Auto-add all provider models",
+                              })}
+                            </Button>
+                          </div>
                           <Button
                             type="button"
                             variant="ghost"
                             size="icon"
-                            className="h-9 w-9 text-muted-foreground hover:text-destructive"
-                            onClick={() => handleRemoveCustomModelRow(index)}
-                            aria-label={t("codexConfig.removeCustomModel", {
-                              defaultValue: "删除",
+                            className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                            onClick={() =>
+                              handleRemoveCustomProviderGroup(rowIds)
+                            }
+                            aria-label={t("codexConfig.removeCustomProvider", {
+                              defaultValue: "Remove provider mappings",
                             })}
                           >
                             <Trash2 className="h-4 w-4" />
                           </Button>
                         </div>
 
-                        {extraRoutes.length > 0 && (
-                          <div className="space-y-2 pt-2">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-xs font-medium text-muted-foreground">
-                                {t("codexConfig.customRouteChainTitle", {
-                                  defaultValue: "删除",
-                                })}
-                              </span>
-                            </div>
-                            {extraRoutes.map((route, extraIndex) => {
-                              const routeIndex = extraIndex + 1;
-                              return (
-                                <div
-                                  key={route.routeId}
-                                  className="grid grid-cols-1 items-center gap-2 md:grid-cols-[44px_minmax(0,1.2fr)_minmax(0,1fr)_92px_36px_36px]"
-                                >
-                                  <div
-                                    className="flex h-9 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground"
-                                    aria-label={t(
-                                      "codexConfig.customRoutePriority",
-                                      {
-                                        defaultValue: "更多路由（按优先级尝试）",
-                                      },
-                                    )}
-                                  >
-                                    {routeIndex + 1}
-                                  </div>
-                                  <Select
-                                    value={route.providerId}
-                                    onValueChange={(value) =>
-                                      handleCustomRouteProviderChange(
-                                        index,
-                                        routeIndex,
-                                        value,
-                                      )
-                                    }
-                                  >
-                                    <SelectTrigger
-                                      className="min-w-0 select-fade-value"
-                                      aria-label={t(
-                                        "codexConfig.customColumnProvider",
-                                        {
-                                          defaultValue: "优先级",
-                                        },
-                                      )}
-                                    >
-                                      <SelectValue
-                                        placeholder={t(
-                                          "codexConfig.customProviderPlaceholder",
-                                          {
-                                            defaultValue: "供应商",
-                                          },
-                                        )}
-                                      />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      {codexProviders
-                                        .filter(
-                                          (provider) =>
-                                            !(
-                                              !enableOfficialLogin &&
-                                              provider.id ===
-                                                CODEX_OFFICIAL_PROVIDER_ID
-                                            ),
-                                        )
-                                        .map((provider) => (
-                                          <SelectItem
-                                            key={provider.id}
-                                            value={provider.id}
-                                          >
-                                            {provider.name}
-                                          </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                  </Select>
-                                  <ModelInputWithFetch
-                                    id={`custom-upstream-${index}-${routeIndex}`}
-                                    value={route.upstreamModel ?? ""}
-                                    onChange={(value) =>
-                                      handleCustomRouteModelChange(
-                                        index,
-                                        routeIndex,
-                                        value,
-                                      )
-                                    }
-                                    placeholder={t(
-                                      "codexConfig.catalogColumnModel",
-                                      {
-                                        defaultValue: "实际请求模型",
-                                      },
-                                    )}
-                                    fetchedModels={(
-                                      customCatalogByProvider[
-                                        route.providerId
-                                      ] ?? []
-                                    ).map((model) => ({
-                                      id: model.model,
-                                      ownedBy:
-                                        codexProviders.find(
-                                          (p) =>
-                                            p.id === route.providerId,
-                                        )?.name ?? "Catalog",
-                                    }))}
-                                    isLoading={false}
-                                    disabled={!route.providerId}
-                                    ariaLabel={t(
-                                      "codexConfig.catalogColumnModel",
-                                      {
-                                        defaultValue: "实际请求模型",
-                                      },
-                                    )}
-                                  />
-                                  <div className="flex items-center gap-1">
-                                    <Button
-                                      type="button"
-                                      variant="ghost"
-                                      size="icon"
-                                      className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                                      disabled={routeIndex === 1}
-                                      onClick={() =>
-                                        handleMoveCustomModelRoute(
-                                          index,
-                                          routeIndex,
-                                          -1,
-                                        )
-                                      }
-                                      aria-label={t(
-                                        "codexConfig.moveCustomRouteUp",
-                                        { defaultValue: "上移" },
-                                      )}
-                                    >
-                                      <ArrowUp className="h-4 w-4" />
-                                    </Button>
-                                    <Button
-                                      type="button"
-                                      variant="ghost"
-                                      size="icon"
-                                      className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                                      disabled={
-                                        routeIndex === row.routes.length - 1
-                                      }
-                                      onClick={() =>
-                                        handleMoveCustomModelRoute(
-                                          index,
-                                          routeIndex,
-                                          1,
-                                        )
-                                      }
-                                      aria-label={t(
-                                        "codexConfig.moveCustomRouteDown",
-                                        { defaultValue: "下移" },
-                                      )}
-                                    >
-                                      <ArrowDown className="h-4 w-4" />
-                                    </Button>
-                                  </div>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                                    disabled={row.routes.length <= 1}
-                                    onClick={() =>
-                                      handleRemoveCustomModelRoute(
-                                        index,
-                                        routeIndex,
-                                      )
-                                    }
-                                    aria-label={t(
-                                      "codexConfig.removeCustomRoute",
-                                      { defaultValue: "移除路由" },
-                                    )}
-                                  >
-                                    <Trash2 className="h-4 w-4" />
-                                  </Button>
-                                </div>
-                              );
+                        <div className="hidden grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,120px)_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+                          <span>
+                            {t("codexConfig.catalogColumnDisplay", {
+                              defaultValue: "Display name",
                             })}
-                          </div>
-                        )}
+                          </span>
+                          <span>
+                            {t("codexConfig.catalogColumnModel", {
+                              defaultValue: "Request model",
+                            })}
+                          </span>
+                          <span>
+                            {t("codexConfig.catalogColumnContext", {
+                              defaultValue: "Context window",
+                            })}
+                          </span>
+                          <span />
+                        </div>
+
+                        <div className="space-y-2">
+                          {group.rows.map(({ row, index }) => {
+                            const primaryRoute = row.routes[0];
+                            return (
+                              <div
+                                key={row.rowId}
+                                className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,120px)_36px]"
+                              >
+                                <Input
+                                  value={row.displayName ?? ""}
+                                  onChange={(event) =>
+                                    handleUpdateCustomRow(index, {
+                                      displayName: event.target.value,
+                                    })
+                                  }
+                                  placeholder={t(
+                                    "codexConfig.catalogDisplayNamePlaceholder",
+                                    { defaultValue: "e.g. DeepSeek V4 Flash" },
+                                  )}
+                                  aria-label={t(
+                                    "codexConfig.catalogColumnDisplay",
+                                    { defaultValue: "Display name" },
+                                  )}
+                                />
+                                <ModelInputWithFetch
+                                  id={`custom-primary-model-${row.rowId}`}
+                                  value={primaryRoute?.upstreamModel ?? ""}
+                                  onChange={(value) =>
+                                    handleCustomRouteModelChange(
+                                      index,
+                                      0,
+                                      value,
+                                    )
+                                  }
+                                  placeholder={t(
+                                    "codexConfig.catalogColumnModel",
+                                    { defaultValue: "Request model" },
+                                  )}
+                                  fetchedModels={customFetchedModelsForProvider(
+                                    group.providerId,
+                                  )}
+                                  isLoading={
+                                    fetchingCustomProviderId ===
+                                    group.providerId
+                                  }
+                                  onFetch={() =>
+                                    handleFetchCustomRouteModels(index, 0)
+                                  }
+                                  disabled={!group.providerId}
+                                  ariaLabel={t(
+                                    "codexConfig.catalogColumnModel",
+                                    { defaultValue: "Request model" },
+                                  )}
+                                />
+                                <Input
+                                  type="number"
+                                  min={1}
+                                  inputMode="numeric"
+                                  value={row.contextWindow ?? ""}
+                                  onChange={(event) =>
+                                    handleUpdateCustomRow(index, {
+                                      contextWindow: event.target.value.replace(
+                                        /[^\d]/g,
+                                        "",
+                                      ),
+                                    })
+                                  }
+                                  placeholder={t(
+                                    "codexConfig.contextWindowPlaceholder",
+                                    { defaultValue: "e.g. 128000" },
+                                  )}
+                                  aria-label={t(
+                                    "codexConfig.catalogColumnContext",
+                                    { defaultValue: "Context window" },
+                                  )}
+                                />
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-9 w-9 text-muted-foreground hover:text-destructive"
+                                  onClick={() =>
+                                    handleRemoveCustomModelRow(index)
+                                  }
+                                  aria-label={t(
+                                    "codexConfig.removeCustomModel",
+                                    { defaultValue: "Remove model mapping" },
+                                  )}
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
+                              </div>
+                            );
+                          })}
+                        </div>
 
                         <div className="pt-1">
                           <Button
                             type="button"
                             variant="outline"
                             size="sm"
-                            onClick={() => handleAddCustomModelRoute(index)}
+                            onClick={() =>
+                              handleAddCustomModelMapping(group.providerId)
+                            }
+                            disabled={!group.providerId}
                             className="h-7 gap-1"
                           >
                             <Plus className="h-4 w-4" />
-                            {t("codexConfig.addCustomRoute", {
-                              defaultValue: "添加路由",
+                            {t("codexConfig.addCustomModelMapping", {
+                              defaultValue: "Add Model Mapping",
                             })}
                           </Button>
+                          {!group.providerId && (
+                            <span className="ml-2 text-xs text-muted-foreground">
+                              {t(
+                                "codexConfig.selectProviderBeforeAddingModel",
+                                {
+                                  defaultValue: "Select a provider first",
+                                },
+                              )}
+                            </span>
+                          )}
                         </div>
+
+                        {provider && group.rows.length > 1 && (
+                          <p className="text-xs text-muted-foreground">
+                            {t("codexConfig.providerModelCount", {
+                              defaultValue:
+                                "{{provider}}: {{count}} model mappings",
+                              provider: provider.name,
+                              count: group.rows.length,
+                            })}
+                          </p>
+                        )}
                       </div>
                     );
                   })}

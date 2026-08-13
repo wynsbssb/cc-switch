@@ -60,6 +60,14 @@ const settingsApiApplyMock = vi.fn();
 const openclawApiGetModelCatalogMock = vi.fn();
 const openclawApiGetDefaultModelMock = vi.fn();
 const openclawApiSetDefaultModelMock = vi.fn();
+const setProxyTakeoverForAppMock = vi.fn();
+
+vi.mock("@/lib/api/proxy", () => ({
+  proxyApi: {
+    setProxyTakeoverForApp: (...args: unknown[]) =>
+      setProxyTakeoverForAppMock(...args),
+  },
+}));
 
 vi.mock("@/lib/api", () => ({
   providersApi: {
@@ -118,6 +126,7 @@ beforeEach(() => {
   openclawApiGetModelCatalogMock.mockReset();
   openclawApiGetDefaultModelMock.mockReset();
   openclawApiSetDefaultModelMock.mockReset();
+  setProxyTakeoverForAppMock.mockReset();
   toastSuccessMock.mockReset();
   toastErrorMock.mockReset();
   toastInfoMock.mockReset();
@@ -378,6 +387,129 @@ describe("useProviderActions", () => {
     expect(toastWarningMock).toHaveBeenCalledWith(
       expect.stringContaining("Claude Desktop 本地路由模式"),
     );
+  });
+
+  it("automatically enables local forwarding for Codex model aggregation", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce(undefined);
+    setProxyTakeoverForAppMock.mockResolvedValueOnce(undefined);
+    const { wrapper } = createWrapper();
+    const provider = createProvider({
+      id: "codex-official",
+      category: "official",
+      settingsConfig: {
+        codexAggregationEnabled: true,
+        codexCustomModels: [
+          {
+            model: "mapped-model",
+            routes: [{ providerId: "upstream-provider" }],
+          },
+        ],
+      },
+    });
+
+    const { result } = renderHook(
+      () => useProviderActions("codex", false, false),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.switchProvider(provider);
+    });
+
+    expect(switchProviderMutateAsync).toHaveBeenCalledWith("codex-official");
+    expect(setProxyTakeoverForAppMock).toHaveBeenCalledWith("codex", true);
+    expect(switchProviderMutateAsync.mock.invocationCallOrder[0]).toBeLessThan(
+      setProxyTakeoverForAppMock.mock.invocationCallOrder[0],
+    );
+    expect(toastWarningMock).not.toHaveBeenCalled();
+  });
+
+  it("does not re-enable forwarding when Codex takeover is already active", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce(undefined);
+    const { wrapper } = createWrapper();
+    const provider = createProvider({
+      id: "codex-official",
+      category: "official",
+      settingsConfig: {
+        codexAggregationEnabled: true,
+        codexCustomModels: [
+          {
+            model: "mapped-model",
+            routes: [{ providerId: "upstream-provider" }],
+          },
+        ],
+      },
+    });
+
+    const { result } = renderHook(
+      () => useProviderActions("codex", true, true),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.switchProvider(provider);
+    });
+
+    expect(setProxyTakeoverForAppMock).not.toHaveBeenCalled();
+  });
+
+  it("does not enable forwarding for a normal Codex official configuration", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce(undefined);
+    const { wrapper } = createWrapper();
+    const provider = createProvider({
+      id: "codex-official",
+      category: "official",
+      settingsConfig: {
+        codexAggregationEnabled: false,
+        codexCustomModels: [],
+      },
+    });
+
+    const { result } = renderHook(
+      () => useProviderActions("codex", false, false),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.switchProvider(provider);
+    });
+
+    expect(setProxyTakeoverForAppMock).not.toHaveBeenCalled();
+  });
+
+  it("reports an automatic forwarding failure after keeping the provider switch", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce(undefined);
+    setProxyTakeoverForAppMock.mockRejectedValueOnce(new Error("proxy failed"));
+    const { wrapper } = createWrapper();
+    const provider = createProvider({
+      id: "codex-official",
+      category: "official",
+      settingsConfig: {
+        codexAggregationEnabled: true,
+        codexCustomModels: [
+          {
+            model: "mapped-model",
+            routes: [{ providerId: "upstream-provider" }],
+          },
+        ],
+      },
+    });
+
+    const { result } = renderHook(
+      () => useProviderActions("codex", false, false),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.switchProvider(provider);
+    });
+
+    expect(switchProviderMutateAsync).toHaveBeenCalledWith("codex-official");
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      expect.stringContaining("proxy failed"),
+      { duration: 6000 },
+    );
+    expect(toastSuccessMock).not.toHaveBeenCalled();
   });
 
   it("allows the built-in Codex official provider during takeover", async () => {

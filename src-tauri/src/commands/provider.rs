@@ -95,8 +95,9 @@ fn switch_provider_internal(
         // 后台执行 + 数据未变化时跳过：避免每次切换 Codex 路由都同步复制
         // 数百 MB 的会话文件而拖慢切换。
         std::thread::spawn(|| {
-            if let Err(e) = crate::codex_desktop_conversations::
-                snapshot_codex_desktop_conversations_if_changed()
+            if let Err(e) =
+                crate::codex_desktop_conversations::snapshot_codex_desktop_conversations_if_changed(
+                )
             {
                 log::warn!("Codex desktop conversation snapshot before switch failed: {e}");
             }

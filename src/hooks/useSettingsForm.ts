@@ -121,7 +121,6 @@ export function useSettingsForm(): UseSettingsFormResult {
       unifyCodexSessionHistory: data.unifyCodexSessionHistory ?? false,
       backupCodexDesktopConversations:
         data.backupCodexDesktopConversations ?? true,
-      unifyCodexSessionStorage: data.unifyCodexSessionStorage ?? false,
       claudeConfigDir: sanitizeDir(data.claudeConfigDir),
       codexConfigDir: sanitizeDir(data.codexConfigDir),
       geminiConfigDir: sanitizeDir(data.geminiConfigDir),
@@ -150,7 +149,6 @@ export function useSettingsForm(): UseSettingsFormResult {
             preserveCodexOfficialAuthOnSwitch: false,
             unifyCodexSessionHistory: false,
             backupCodexDesktopConversations: true,
-            unifyCodexSessionStorage: false,
             language: readPersistedLanguage(),
           } as SettingsFormState);
 
@@ -193,7 +191,6 @@ export function useSettingsForm(): UseSettingsFormResult {
         unifyCodexSessionHistory: serverData.unifyCodexSessionHistory ?? false,
         backupCodexDesktopConversations:
           serverData.backupCodexDesktopConversations ?? true,
-        unifyCodexSessionStorage: serverData.unifyCodexSessionStorage ?? false,
         claudeConfigDir: sanitizeDir(serverData.claudeConfigDir),
         codexConfigDir: sanitizeDir(serverData.codexConfigDir),
         geminiConfigDir: sanitizeDir(serverData.geminiConfigDir),

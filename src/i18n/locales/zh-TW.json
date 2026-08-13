@@ -310,16 +310,6 @@
       "restoreBackup": "把開啟時遷入的官方會話還原回官方歷史（按備份精確還原）",
       "confirm": "關閉"
     },
-    "unifyCodexStorage": {
-      "title": "啟用會話資料統一存放",
-      "message": "把 Codex 會話與狀態資料統一遷移到 ~/.cc-switch/codex（會話目錄透過系統目錄連結透明指向該位置，狀態庫由 config 注入 sqlite_home）。之後切換供應商/路由只改 config 與 auth，不再逐次複製會話資料，切換會更快。\n\n遷移會把現有 ~/.codex 下的 sessions、archived_sessions 與 state_5.sqlite 移到統一目錄。建議先退出 ChatGPT/Codex 桌面端。",
-      "confirm": "遷移並啟用"
-    },
-    "unifyCodexStorageOff": {
-      "title": "關閉會話資料統一存放",
-      "message": "關閉後，統一目錄裡的會話與狀態資料會移回 ~/.codex，並移除目錄連結。若 ChatGPT/Codex 桌面端正在執行，檔案被占用時移動可能失敗，建議先退出桌面端。",
-      "confirm": "移回並關閉"
-    },
     "restoreCodexDesktopConversations": {
       "title": "還原桌面端對話資料",
       "message": "將用最近一次自動備份覆蓋目前桌面端本機會話（會話檔案、會話索引與狀態庫）。還原前會先把目前資料備份到 ~/.cc-switch/backups 下的 pre-restore 目錄，操作可回退。\n\n建議先退出 ChatGPT 桌面端，避免狀態庫被占用導致還原失敗。",
@@ -725,12 +715,6 @@
     "restoreCodexDesktopConversationsCompleted": "已從備份還原桌面端對話資料（{{files}} 個會話檔案、{{dbs}} 個狀態庫）",
     "restoreCodexDesktopConversationsFailed": "還原桌面端對話資料失敗，請重試",
     "restoreCodexDesktopConversationsNothing": "目前 Codex 目錄沒有可還原的對話資料備份",
-    "unifyCodexStorage": "會話資料統一存放",
-    "unifyCodexStorageDescription": "把 Codex 會話與狀態資料統一放到 ~/.cc-switch/codex（目錄連結 + sqlite_home）。之後切換路由只改設定、不複製會話，切換更快且會話資料永不被路由切換觸碰。",
-    "unifyCodexStorageEnabled": "已啟用會話資料統一存放，路由切換不再複製會話",
-    "unifyCodexStorageEnableFailed": "啟用會話資料統一存放失敗，請重試",
-    "unifyCodexStorageDisabled": "已關閉會話資料統一存放，資料已移回 ~/.codex",
-    "unifyCodexStorageDisableFailed": "關閉會話資料統一存放失敗，請先退出 ChatGPT/Codex 桌面端後重試",
     "appVisibility": {
       "title": "主頁面顯示",
       "description": "選擇在主頁面顯示的應用程式",
@@ -1376,11 +1360,11 @@
     "upstreamFormatAnthropic": "Anthropic Messages（需開啟路由）",
     "anthropicAuthFieldLabel": "認證欄位",
     "anthropicAuthFieldAuthToken": "ANTHROPIC_AUTH_TOKEN（Authorization）",
-    "customModelsTitle": "自訂模型清單",
+    "customModelsTitle": "供應商模型映射",
     "aggregationLabel": "????",
-    "aggregationHint": "????????????????? Codex????????/????",
-    "customModelsHint": "???????? Codex ?????????????????????????",
-    "customModelsHintAggregate": "選擇供應商並填寫實際請求模型，CC Switch 會自動生成 Codex 顯示模型並映射到該供應商；上下文視窗留空按 128k 處理。",
+    "aggregationHint": "開啟後可將其他供應商的模型加入 Codex 模型對應；切換到此設定時會自動啟用所需的本機轉送，無需另外開啟路由。關閉時按一般官方模型登入處理。",
+    "customModelsHint": "依供應商設定 Codex 選單模型；同一供應商可連續新增多條模型映射，選擇模型時由本機代理轉送到對應供應商。",
+    "customModelsHintAggregate": "依供應商設定模型映射，同一供應商可新增多個模型；上下文視窗留空時按 128k 處理。",
     "enableOfficialLoginLabel": "??????",
     "enableOfficialLoginHintOn": "?????? ChatGPT ??????????????????????",
     "enableOfficialLoginHintOff": "??????????????????????????",
@@ -1439,7 +1423,13 @@
     "reasoningGroupTitle": "思考能力",
     "reasoningSectionHint": "預設供應商已自動設定；自訂供應商會按名稱/位址自動推斷。僅當自動識別不準時才需手動覆寫。",
     "advancedSectionHint": "包含上游格式、模型映射、思考能力與自訂 User-Agent。使用 Chat Completions 協定的供應商需開啟路由接管才能使用。",
-    "noCommonConfigToApply": "通用設定片段為空或沒有可寫入的內容"
+    "noCommonConfigToApply": "通用設定片段為空或沒有可寫入的內容",
+    "addCustomProvider": "新增供應商",
+    "addCustomModelMapping": "新增模型映射",
+    "removeCustomProvider": "刪除供應商映射",
+    "selectProviderBeforeAddingModel": "請先選擇供應商",
+    "providerModelCount": "{{provider}}：{{count}} 個模型映射",
+    "autoAddProviderModels": "自動新增該供應商全部模型"
   },
   "geminiConfig": {
     "envFile": "環境變數 (.env)",

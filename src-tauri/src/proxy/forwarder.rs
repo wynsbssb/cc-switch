@@ -419,6 +419,7 @@ impl RequestForwarder {
             let mut rectifier_retried = false;
             let mut budget_rectifier_retried = false;
             let mut media_rectifier_retried = false;
+            let mut input_rectifier_retried = false;
 
             // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
             // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
@@ -656,6 +657,133 @@ impl RequestForwarder {
                                             app_type_str,
                                             used_half_open_permit,
                                             "media 降级",
+                                            &mut last_error,
+                                            &mut last_provider,
+                                        )
+                                        .await
+                                    {
+                                        return Err(err);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // Native Responses passthrough: a strict upstream may
+                    // reject replayed history items whose `content` is a
+                    // non-empty array (`reasoning` items carrying plaintext
+                    // chain-of-thought, legacy `function_call` /
+                    // `function_call_output` items). Normalize those arrays to
+                    // `[]` and retry once. Purely reactive: providers that
+                    // accept the shape (e.g. DeepSeek, which requires
+                    // `reasoning_text` to be passed back for thinking-mode
+                    // continuation) never trigger this branch.
+                    if matches!(app_type, AppType::Codex | AppType::GrokBuild)
+                        && !super::providers::should_convert_codex_responses_to_chat(
+                            provider,
+                            endpoint,
+                        )
+                        && !super::providers::should_convert_codex_responses_to_anthropic(
+                            provider,
+                            endpoint,
+                        )
+                        && self.rectifier_config.enabled
+                        && !input_rectifier_retried
+                        && super::providers::transform_codex_responses_input::
+                            is_content_array_too_long_error(&e)
+                    {
+                        let mut sanitized_body = provider_body.clone();
+                        let fixed = super::providers::transform_codex_responses_input::
+                            sanitize_input_content_arrays(&mut sanitized_body);
+
+                        if fixed > 0 {
+                            let _ = std::mem::replace(&mut input_rectifier_retried, true);
+                            log::info!(
+                                "[{app_type_str}] [ResponsesInput] Upstream rejected non-empty content array on {fixed} input item(s); retrying provider={} with content normalized to empty arrays",
+                                provider.id
+                            );
+
+                            match self
+                                .forward(
+                                    app_type,
+                                    &method,
+                                    provider,
+                                    endpoint,
+                                    &sanitized_body,
+                                    &headers,
+                                    &extensions,
+                                    adapter.as_ref(),
+                                )
+                                .await
+                            {
+                                Ok((response, claude_api_format, outbound_model)) => {
+                                    log::info!(
+                                        "[{app_type_str}] [ResponsesInput] Retry succeeded after normalizing input content arrays"
+                                    );
+                                    self.record_success_result(
+                                        &provider.id,
+                                        app_type_str,
+                                        used_half_open_permit,
+                                    )
+                                    .await;
+
+                                    {
+                                        let mut current_providers =
+                                            self.current_providers.write().await;
+                                        current_providers.insert(
+                                            app_type_str.to_string(),
+                                            (provider.id.clone(), provider.name.clone()),
+                                        );
+                                    }
+
+                                    {
+                                        let mut status = self.status.write().await;
+                                        status.success_requests += 1;
+                                        status.last_error = None;
+                                        let should_switch =
+                                            self.current_provider_id_at_start.as_str()
+                                                != provider.id.as_str();
+                                        if should_switch {
+                                            status.failover_count += 1;
+                                            let fm = self.failover_manager.clone();
+                                            let ah = self.app_handle.clone();
+                                            let pid = provider.id.clone();
+                                            let pname = provider.name.clone();
+                                            let at = app_type_str.to_string();
+
+                                            tokio::spawn(async move {
+                                                let _ = fm
+                                                    .try_switch(ah.as_ref(), &at, &pid, &pname)
+                                                    .await;
+                                            });
+                                        }
+                                        if status.total_requests > 0 {
+                                            status.success_rate = (status.success_requests as f32
+                                                / status.total_requests as f32)
+                                                * 100.0;
+                                        }
+                                    }
+
+                                    return Ok(ForwardResult {
+                                        response,
+                                        provider: provider.clone(),
+                                        claude_api_format,
+                                        outbound_model,
+                                        connection_guard: None,
+                                    });
+                                }
+                                Err(retry_err) => {
+                                    log::warn!(
+                                        "[{app_type_str}] [ResponsesInput] Retry still failed after normalizing input content arrays: {retry_err}"
+                                    );
+                                    if let Some(err) = self
+                                        .handle_rectifier_retry_failure(
+                                            retry_err,
+                                            provider,
+                                            app_type_str,
+                                            used_half_open_permit,
+                                            "Responses input 清洗",
                                             &mut last_error,
                                             &mut last_provider,
                                         )
@@ -1570,6 +1698,41 @@ impl RequestForwarder {
                 "[Codex] Sanitized xAI-unsupported Responses fields (provider={})",
                 provider.id
             );
+        }
+
+        // Native Responses passthrough (Codex/GrokBuild, every provider):
+        // normalize replayed-history items whose `content` array strict
+        // Responses schemas only accept as empty (`reasoning` items carrying
+        // plaintext chain-of-thought, legacy `function_call` /
+        // `function_call_output` items). Proactive, so the invalid shape
+        // never reaches a strict upstream regardless of how that upstream
+        // words its rejection. Vendors that require reasoning content
+        // round-trips (DeepSeek et al.) are skipped here; the reactive retry
+        // in `forward_with_retry_inner` stays as the safety net for them. The
+        // managed xAI path is also skipped: its own sanitizer deliberately
+        // preserves reasoning content arrays (locked by tests), so this layer
+        // must not change that behavior.
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+            && self.rectifier_config.enabled
+            && !super::providers::provider_needs_responses_namespace_flatten(provider)
+            && !super::providers::provider_requires_reasoning_content_roundtrip(
+                provider,
+                &request_body,
+            )
+        {
+            let fixed =
+                super::providers::transform_codex_responses_input::sanitize_input_content_arrays(
+                    &mut request_body,
+                );
+            if fixed > 0 {
+                log::info!(
+                    "[{}] [ResponsesInput] Normalized content arrays on {fixed} input item(s) for native Responses upstream (provider={})",
+                    app_type.as_str(),
+                    provider.id
+                );
+            }
         }
 
         // 原生 Responses 直连（Codex/GrokBuild）：应用供应商的上游模型映射。
@@ -4858,7 +5021,7 @@ mod tests {
     fn prevention_replaces_when_all_switches_on_and_model_in_heuristic_list() {
         let fwd = forwarder_with_rectifier(RectifierConfig::default());
         let provider = provider_with_settings(json!({}));
-        let mut body = body_with_image("deepseek-v4-pro");
+        let mut body = body_with_image("glm-5.2");
 
         let replaced = fwd.apply_media_prevention(&mut body, &provider);
 
@@ -4874,7 +5037,7 @@ mod tests {
             ..RectifierConfig::default()
         });
         let provider = provider_with_settings(json!({}));
-        let mut body = body_with_image("deepseek-v4-pro");
+        let mut body = body_with_image("glm-5.2");
 
         let replaced = fwd.apply_media_prevention(&mut body, &provider);
 
@@ -4889,7 +5052,7 @@ mod tests {
             ..RectifierConfig::default()
         });
         let provider = provider_with_settings(json!({}));
-        let mut body = body_with_image("deepseek-v4-pro");
+        let mut body = body_with_image("glm-5.2");
 
         assert_eq!(fwd.apply_media_prevention(&mut body, &provider), 0);
         assert_eq!(body["messages"][0]["content"][0]["type"], "image");
@@ -4905,7 +5068,7 @@ mod tests {
 
         // (a) 名单内模型、无显式声明 → 不再预替换
         let bare_provider = provider_with_settings(json!({}));
-        let mut list_body = body_with_image("deepseek-v4-pro");
+        let mut list_body = body_with_image("glm-5.2");
         assert_eq!(
             fwd.apply_media_prevention(&mut list_body, &bare_provider),
             0,

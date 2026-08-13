@@ -36,19 +36,6 @@ export interface CodexDesktopConversationsRestoreResult {
   skippedReason?: string;
 }
 
-export interface CodexUnifiedStorageResult {
-  enabled: boolean;
-  active: boolean;
-  codexDir: string;
-  sessionsDir: string;
-  archivedDir: string;
-  stateDir: string;
-  migratedSessions: number;
-  migratedArchived: number;
-  migratedStateDbs: number;
-  skippedReason?: string;
-}
-
 export interface CodexUnifyHistoryRestoreResult {
   restoredJsonlFiles: number;
   restoredStateRows: number;
@@ -92,21 +79,6 @@ export const settingsApi = {
   /** 从最新快照恢复 Codex 桌面端对话数据 */
   async restoreCodexDesktopConversations(): Promise<CodexDesktopConversationsRestoreResult> {
     return await invoke("restore_codex_desktop_conversations");
-  },
-
-  /** 启用 Codex 会话/状态数据统一存放（迁移 + 建目录链接 + 注入 sqlite_home） */
-  async enableCodexUnifiedStorage(): Promise<CodexUnifiedStorageResult> {
-    return await invoke("enable_codex_unified_storage");
-  },
-
-  /** 关闭 Codex 会话/状态数据统一存放（数据移回 ~/.codex + 撤链接） */
-  async disableCodexUnifiedStorage(): Promise<CodexUnifiedStorageResult> {
-    return await invoke("disable_codex_unified_storage");
-  },
-
-  /** 查询 Codex 统一存储状态 */
-  async getCodexUnifiedStorageStatus(): Promise<CodexUnifiedStorageResult> {
-    return await invoke("get_codex_unified_storage_status");
   },
 
   async restart(): Promise<boolean> {

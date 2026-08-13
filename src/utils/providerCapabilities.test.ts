@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
-import { providerNeedsRouting } from "@/utils/providerCapabilities";
+import {
+  providerHasCodexModelAggregation,
+  providerNeedsRouting,
+} from "@/utils/providerCapabilities";
 
 function mkProvider(overrides: Partial<Provider> = {}): Provider {
   return { id: "p1", name: "Test", settingsConfig: {}, ...overrides };
@@ -203,5 +206,98 @@ describe("providerNeedsRouting", () => {
         ).toBe(true);
       },
     );
+  });
+});
+
+describe("providerHasCodexModelAggregation", () => {
+  const aggregatedProvider = (settingsConfig: Record<string, unknown>) =>
+    mkProvider({
+      id: "codex-official",
+      category: "official",
+      settingsConfig,
+    });
+
+  it("detects a valid enabled Codex model mapping", () => {
+    expect(
+      providerHasCodexModelAggregation(
+        "codex",
+        aggregatedProvider({
+          codexAggregationEnabled: true,
+          codexCustomModels: [
+            {
+              model: "mapped-model",
+              routes: [{ providerId: "upstream-provider" }],
+            },
+          ],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("supports the legacy single-provider mapping shape", () => {
+    expect(
+      providerHasCodexModelAggregation(
+        "codex",
+        aggregatedProvider({
+          codexCustomModels: [
+            { model: "mapped-model", providerId: "upstream-provider" },
+          ],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("ignores disabled or empty mappings", () => {
+    expect(
+      providerHasCodexModelAggregation(
+        "codex",
+        aggregatedProvider({
+          codexAggregationEnabled: false,
+          codexCustomModels: [
+            {
+              model: "mapped-model",
+              routes: [{ providerId: "upstream-provider" }],
+            },
+          ],
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      providerHasCodexModelAggregation(
+        "codex",
+        aggregatedProvider({
+          codexAggregationEnabled: true,
+          codexCustomModels: [{ model: "mapped-model", routes: [] }],
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("only applies to the built-in Codex official provider", () => {
+    const settingsConfig = {
+      codexAggregationEnabled: true,
+      codexCustomModels: [
+        {
+          model: "mapped-model",
+          routes: [{ providerId: "upstream-provider" }],
+        },
+      ],
+    };
+    expect(
+      providerHasCodexModelAggregation(
+        "claude",
+        aggregatedProvider(settingsConfig),
+      ),
+    ).toBe(false);
+    expect(
+      providerHasCodexModelAggregation(
+        "codex",
+        mkProvider({
+          id: "copied-official-provider",
+          category: "official",
+          settingsConfig,
+        }),
+      ),
+    ).toBe(false);
   });
 });

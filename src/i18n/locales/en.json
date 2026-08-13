@@ -310,16 +310,6 @@
       "restoreBackup": "Restore the official sessions migrated at enable time back to the official history (exact restore from backup)",
       "confirm": "Turn off"
     },
-    "unifyCodexStorage": {
-      "title": "Enable unified session storage",
-      "message": "Move Codex session and state data under ~/.cc-switch/codex (the sessions folder is transparently linked from ~/.codex, and the state DB is redirected via sqlite_home in config). Provider/route switches will then only rewrite config and auth, never copying session data, so switching becomes fast.\n\nThe existing ~/.codex sessions, archived_sessions and state_5.sqlite will be moved into the unified directory. Quit the ChatGPT/Codex desktop app first if possible.",
-      "confirm": "Migrate & enable"
-    },
-    "unifyCodexStorageOff": {
-      "title": "Turn off unified session storage",
-      "message": "After turning this off, the session and state data will be moved back to ~/.codex and the directory links removed. If the ChatGPT/Codex desktop app is running, moving locked files may fail; quit the desktop app first.",
-      "confirm": "Move back & turn off"
-    },
     "restoreCodexDesktopConversations": {
       "title": "Restore desktop conversation data",
       "message": "This overwrites the current local desktop conversations (session files, session index and state DB) with the latest automatic backup. Your current data is first moved to a pre-restore folder under ~/.cc-switch/backups, so the operation is reversible.\n\nIt is recommended to quit the ChatGPT desktop app first so the state DB is not locked.",
@@ -725,12 +715,6 @@
     "restoreCodexDesktopConversationsCompleted": "Desktop conversations restored from backup ({{files}} session files, {{dbs}} state DBs)",
     "restoreCodexDesktopConversationsFailed": "Failed to restore desktop conversations, please try again",
     "restoreCodexDesktopConversationsNothing": "No conversation backup for the current Codex directory",
-    "unifyCodexStorage": "Unified session storage",
-    "unifyCodexStorageDescription": "Keep Codex session and state data in one place under ~/.cc-switch/codex (directory links + sqlite_home). Route switches only rewrite config, never copy sessions, so switching is fast and session data is never touched.",
-    "unifyCodexStorageEnabled": "Unified session storage enabled; route switches no longer copy session data",
-    "unifyCodexStorageEnableFailed": "Failed to enable unified session storage",
-    "unifyCodexStorageDisabled": "Unified session storage disabled; data moved back to ~/.codex",
-    "unifyCodexStorageDisableFailed": "Failed to disable unified session storage; quit the ChatGPT/Codex desktop app and retry",
     "appVisibility": {
       "title": "Homepage Display",
       "description": "Choose which apps to show on the homepage",
@@ -1408,11 +1392,11 @@
     "catalogColumnDisplay": "Menu Display Name",
     "catalogColumnModel": "Actual Request Model",
     "catalogColumnContext": "Context Window",
-    "customModelsTitle": "Custom Model List",
+    "customModelsTitle": "Provider Model Mappings",
     "aggregationLabel": "Model aggregation",
-    "aggregationHint": "When enabled, models from other providers can be aggregated into Codex (requires the local routing/proxy to be enabled). When disabled, the official provider works as a normal official login.",
-    "customModelsHint": "These models appear in Codex's model list; selecting one makes the local proxy route the request to the bound provider (converting the protocol as needed) while keeping your official login.",
-    "customModelsHintAggregate": "Pick a provider and enter its actual request model; CC Switch will auto-generate the Codex display model and map it to that provider. Leave the context window empty to default to 128k.",
+    "aggregationHint": "Add models from other providers to Codex's model mapping. Required local forwarding is enabled automatically when this configuration is activated. When disabled, the official provider works as a normal official login.",
+    "customModelsHint": "Configure Codex menu models by provider. Each provider can contain multiple model mappings, and the local proxy forwards the selected model to that provider.",
+    "customModelsHintAggregate": "Configure mappings by provider. Each provider can contain multiple models; an empty context window defaults to 128k.",
     "enableOfficialLoginLabel": "Enable Official Login",
     "enableOfficialLoginHintOn": "Official models use your ChatGPT account login; custom models below still use each provider's own credentials.",
     "enableOfficialLoginHintOff": "No login required: all models come from the providers configured below and requests route by model.",
@@ -1440,7 +1424,13 @@
     "reasoningGroupTitle": "Reasoning Capability",
     "reasoningSectionHint": "Preset providers are configured automatically; custom providers are inferred from name/URL. Override manually only when auto-detection is wrong.",
     "advancedSectionHint": "Includes upstream format, model mapping, reasoning overrides and custom User-Agent. Providers using the Chat Completions protocol require routing takeover to be enabled.",
-    "noCommonConfigToApply": "The common config snippet is empty or contains nothing to write"
+    "noCommonConfigToApply": "The common config snippet is empty or contains nothing to write",
+    "addCustomProvider": "Add Provider",
+    "addCustomModelMapping": "Add Model Mapping",
+    "removeCustomProvider": "Remove provider mappings",
+    "selectProviderBeforeAddingModel": "Select a provider first",
+    "providerModelCount": "{{provider}}: {{count}} model mappings",
+    "autoAddProviderModels": "Auto-add all provider models"
   },
   "geminiConfig": {
     "envFile": "Environment Variables (.env)",

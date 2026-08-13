@@ -61,6 +61,39 @@ pub(crate) const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
 /// ownership sentinel: we only ever remove a `web_search` key whose value equals
 /// this string, never a user's own setting.
 pub(crate) const CODEX_WEB_SEARCH_DISABLED: &str = "disabled";
+/// Codex used `enabled` for the default/live web-search mode in older builds.
+/// Current Codex accepts the explicit enum value `live` instead.
+const CODEX_WEB_SEARCH_LEGACY_ENABLED: &str = "enabled";
+const CODEX_WEB_SEARCH_LIVE: &str = "live";
+
+/// Normalize legacy Codex config values before the file is handed back to Codex.
+///
+/// This deliberately touches only the top-level `web_search` key. Plugin tables
+/// legitimately contain unrelated boolean `enabled = true` fields and must not
+/// be changed. Unknown web-search values are left alone so Codex can report a
+/// useful validation error rather than cc-switch guessing at their meaning.
+fn normalize_codex_config_text(config_text: &str) -> Result<String, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+
+    if doc
+        .get(CODEX_WEB_SEARCH_FIELD)
+        .and_then(|item| item.as_str())
+        == Some(CODEX_WEB_SEARCH_LEGACY_ENABLED)
+    {
+        doc[CODEX_WEB_SEARCH_FIELD] = toml_edit::value(CODEX_WEB_SEARCH_LIVE);
+    }
+
+    Ok(doc.to_string())
+}
+
+fn normalize_codex_config_text_best_effort(config_text: String) -> String {
+    match normalize_codex_config_text(&config_text) {
+        Ok(normalized) => normalized,
+        Err(_) => config_text,
+    }
+}
 
 /// Native `/responses` gateways whose first-party models do NOT support the Codex
 /// `web_search` hosted tool. A BLACKLIST (default-on): everything not listed keeps
@@ -324,7 +357,7 @@ pub fn write_codex_live_atomic(
 
     // 准备写入内容
     let cfg_text = match config_text_opt {
-        Some(s) => s.to_string(),
+        Some(s) => normalize_codex_config_text(s)?,
         None => String::new(),
     };
     if !cfg_text.trim().is_empty() {
@@ -335,8 +368,13 @@ pub fn write_codex_live_atomic(
     // [marketplaces]) already present on disk, same as the config-only
     // writer above, so provider switches never wipe user-installed plugins.
     let existing_config = read_codex_config_text().unwrap_or_default();
+    // Preserve app-level shared config (sqlite_home, [tui], [approval_policy],
+    // [sandbox], user web_search, ...) from the current live file as well, so a
+    // provider/route switch never rebuilds the live config from zero. Provider
+    // owned keys (routing, credentials, catalog, MCP, plugins) are handled by
+    // the new config / the plugin merge below.
+    let cfg_text = merge_codex_app_level_config(&existing_config, &cfg_text)?;
     let cfg_text = merge_codex_plugin_sections(&existing_config, &cfg_text)?;
-    let cfg_text = inject_codex_unified_state_home(&cfg_text)?;
 
     // 第一步：写 auth.json
     write_json_file(&auth_path, auth)?;
@@ -358,11 +396,22 @@ pub fn write_codex_live_atomic(
 /// 读取 `~/.codex/config.toml`，若不存在返回空字符串
 pub fn read_codex_config_text() -> Result<String, AppError> {
     let path = get_codex_config_path();
-    if path.exists() {
-        std::fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))
-    } else {
-        Ok(String::new())
+    if !path.exists() {
+        return Ok(String::new());
     }
+
+    let raw = std::fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?;
+    let normalized = normalize_codex_config_text_best_effort(raw.clone());
+    if normalized != raw {
+        // Repair legacy values before Codex creates a conversation or compacts
+        // context and reloads the configuration.
+        write_text_file(&path, &normalized)?;
+        log::info!(
+            "Migrated legacy Codex web_search value in {}",
+            path.display()
+        );
+    }
+    Ok(normalized)
 }
 
 /// 对非空的 TOML 文本进行语法校验
@@ -370,7 +419,8 @@ pub fn validate_config_toml(text: &str) -> Result<(), AppError> {
     if text.trim().is_empty() {
         return Ok(());
     }
-    toml::from_str::<toml::Table>(text)
+    let normalized = normalize_codex_config_text(text)?;
+    toml::from_str::<toml::Table>(&normalized)
         .map(|_| ())
         .map_err(|e| AppError::toml(Path::new("config.toml"), e))
 }
@@ -406,7 +456,7 @@ pub(crate) fn is_custom_codex_model_provider_id(id: &str) -> bool {
 pub fn write_codex_live_config_atomic(config_text_opt: Option<&str>) -> Result<(), AppError> {
     let config_path = get_codex_config_path();
     let cfg_text = match config_text_opt {
-        Some(config_text) => config_text.to_string(),
+        Some(config_text) => normalize_codex_config_text(config_text)?,
         None => String::new(),
     };
 
@@ -469,6 +519,121 @@ pub fn merge_codex_plugin_sections(
     Ok(target.to_string())
 }
 
+/// Top-level `config.toml` keys that belong to the provider being written and
+/// must always come from the freshly generated text -- never carried over from
+/// the previous live file when switching routes.
+///
+/// - `model` / `model_provider` / `model_providers` / `base_url` / `wire_api`:
+///   routing and endpoint of the newly activated provider.
+/// - `experimental_bearer_token`: provider credential; carrying it over would
+///   leak the previous provider's key into the new provider.
+/// - `model_catalog_json` / `web_search`: re-derived per provider by
+///   `prepare_codex_config_text_with_model_catalog` (the "disabled" web-search
+///   sentinel is cc-switch-owned and must not leak across routes).
+/// - `mcp_servers`: SSOT lives in the DB and is re-projected on every switch.
+/// - `plugins` / `marketplaces`: handled separately by
+///   `merge_codex_plugin_sections`.
+///
+/// Every other top-level key that exists in the current live file is treated as
+/// app-level shared configuration (e.g. `sqlite_home`, `[tui]`,
+/// `[approval_policy]`, `[sandbox]`, `[experimental]`, `model_context_window`)
+/// and is carried over into the new config when the new config does not set it,
+/// so a provider/route switch never rebuilds the live config from zero.
+const CODEX_PROVIDER_OWNED_TOP_LEVEL_KEYS: &[&str] = &[
+    "model",
+    "model_provider",
+    "model_providers",
+    "base_url",
+    "wire_api",
+    "experimental_bearer_token",
+    "model_catalog_json",
+    "web_search",
+    "mcp_servers",
+    "plugins",
+    "marketplaces",
+];
+
+/// Carry app-level shared keys from the existing live `config.toml` into a
+/// freshly generated one, so switching routes keeps the user's application
+/// configuration instead of starting from scratch.
+///
+/// Provider-owned keys are never copied (the new provider's values win), and
+/// keys the new config already sets are left untouched. Table-like values are
+/// deep-merged, so a provider's partial app-level table (e.g. `[tui]` with only
+/// `notifications`) never drops the shared sub-keys the live file still carries.
+/// A user's own `web_search` value (anything but cc-switch's `"disabled"`
+/// sentinel) counts as app-level and is carried; the sentinel itself is
+/// re-derived per provider.
+pub fn merge_codex_app_level_config(
+    existing_config: &str,
+    new_config: &str,
+) -> Result<String, AppError> {
+    let existing_config = normalize_codex_config_text_best_effort(existing_config.to_string());
+    let new_config = normalize_codex_config_text(new_config)?;
+
+    if existing_config.trim().is_empty() {
+        return Ok(new_config);
+    }
+
+    let existing = match existing_config.parse::<DocumentMut>() {
+        Ok(doc) => doc,
+        Err(_) => return Ok(new_config.to_string()),
+    };
+
+    let mut target = match new_config.parse::<DocumentMut>() {
+        Ok(doc) => doc,
+        Err(e) => {
+            return Err(AppError::Message(format!("Invalid Codex config.toml: {e}")));
+        }
+    };
+
+    fn merge_missing(target: &mut dyn toml_edit::TableLike, source: &dyn toml_edit::TableLike) {
+        for (key, item) in source.iter() {
+            if !target.contains_key(key) {
+                target.insert(key, item.clone());
+                continue;
+            }
+            // Deep-merge table-like values so the new provider's partial
+            // app-level table never drops shared sub-keys.
+            if let (Some(target_value), Some(source_value)) = (
+                target
+                    .get_mut(key)
+                    .and_then(toml_edit::Item::as_table_like_mut),
+                item.as_table_like(),
+            ) {
+                merge_missing(target_value, source_value);
+            }
+        }
+    }
+
+    for (key, item) in existing.as_table().iter() {
+        let owned = if key == "web_search" {
+            // cc-switch's own "disabled" sentinel is provider-derived and must
+            // not leak across routes; a user's manual value is app-level.
+            item.as_str() == Some(CODEX_WEB_SEARCH_DISABLED)
+        } else {
+            CODEX_PROVIDER_OWNED_TOP_LEVEL_KEYS.contains(&key)
+        };
+        if owned {
+            continue;
+        }
+        match target.get_mut(key) {
+            Some(target_item) => {
+                if let (Some(target_table), Some(source_table)) =
+                    (target_item.as_table_like_mut(), item.as_table_like())
+                {
+                    merge_missing(target_table, source_table);
+                }
+            }
+            None => {
+                target[key] = item.clone();
+            }
+        }
+    }
+
+    Ok(target.to_string())
+}
+
 /// Write Codex config.toml while preserving the ChatGPT/Codex plugin
 /// registrations ([plugins] / [marketplaces]) already present on disk.
 ///
@@ -477,9 +642,10 @@ pub fn merge_codex_plugin_sections(
 /// user-installed plugins survive every rewrite.
 pub fn write_codex_config_text_preserving_plugins(config_text: &str) -> Result<(), AppError> {
     let config_path = get_codex_config_path();
+    let config_text = normalize_codex_config_text(config_text)?;
     let existing_config = read_codex_config_text().unwrap_or_default();
-    let mut merged = merge_codex_plugin_sections(&existing_config, config_text)?;
-    merged = inject_codex_unified_state_home(&merged)?;
+    let merged = merge_codex_app_level_config(&existing_config, &config_text)?;
+    let merged = merge_codex_plugin_sections(&existing_config, &merged)?;
     write_text_file(&config_path, &merged)
 }
 
@@ -2354,6 +2520,7 @@ pub(crate) fn codex_custom_catalog_entries(
     let native_template = load_codex_native_responses_template();
     let mut proxy_chat_template = None;
     let mut catalog_entries = Vec::with_capacity(entries.len());
+    let mut seen_provider_ids = HashSet::new();
 
     for (index, entry) in entries.iter().enumerate() {
         let bound_provider = match resolve_provider {
@@ -2395,9 +2562,28 @@ pub(crate) fn codex_custom_catalog_entries(
             .upstream_model
             .as_deref()
             .or(provider_default_model.as_deref());
+        // Codex Desktop currently exposes no native section/header field in its model picker.
+        // Prefix the first real model of each provider with a visual separator instead of
+        // inserting a fake selectable model entry.
+        let base_display_name = entry
+            .display_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| entry.model.clone());
+        let first_for_provider = seen_provider_ids.insert(entry.provider_id.clone());
+        let display_name = if first_for_provider {
+            bound_provider
+                .as_ref()
+                .map(|provider| provider.name.trim())
+                .filter(|name| !name.is_empty())
+                .map(|provider_name| format!("------ {provider_name} ------  {base_display_name}"))
+                .or(Some(base_display_name))
+        } else {
+            Some(base_display_name)
+        };
         let spec = CodexCatalogModelSpec {
             model: entry.model.clone(),
-            display_name: entry.display_name.clone(),
+            display_name,
             context_window: entry.context_window,
             supports_parallel_tool_calls: entry.supports_parallel_tool_calls,
             input_modalities: entry.input_modalities.clone().or_else(|| {
@@ -2573,7 +2759,8 @@ fn set_codex_model_catalog_json_field(
 /// lifecycle is bound to the cc-switch catalog pointer so the field is set/cleaned
 /// up wherever the native catalog is written/removed.
 fn set_codex_native_web_search_field(config_text: &str, disable: bool) -> Result<String, AppError> {
-    let mut doc = config_text
+    let normalized = normalize_codex_config_text(config_text)?;
+    let mut doc = normalized
         .parse::<DocumentMut>()
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
 
@@ -3497,86 +3684,6 @@ pub fn strip_codex_unified_session_bucket_from_settings(
     Ok(())
 }
 
-/// 统一会话存储开启时，向 Codex `config.toml` 注入 `sqlite_home`，
-/// 让线程状态库（state_5.sqlite）统一落在 `~/.cc-switch/codex/state`。
-/// 注入只发生在 live 落盘路径；存储配置里的原文不受影响（回填时剥离）。
-pub fn inject_codex_unified_state_home(config_text: &str) -> Result<String, AppError> {
-    if !crate::codex_unified_storage::is_enabled() {
-        return Ok(config_text.to_string());
-    }
-    let normalized = normalize_sqlite_home(&crate::codex_unified_storage::state_dir());
-    let mut doc = config_text
-        .parse::<DocumentMut>()
-        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
-    if doc
-        .get("sqlite_home")
-        .and_then(|item| item.as_str())
-        .map(normalize_sqlite_home_str)
-        .as_deref()
-        == Some(normalized.as_str())
-    {
-        return Ok(config_text.to_string());
-    }
-    doc["sqlite_home"] = toml_edit::value(normalized);
-    Ok(doc.to_string())
-}
-
-/// 从 Codex `config.toml` 剥离 cc-switch 注入的 `sqlite_home`
-/// （仅当值恰好等于统一状态目录时；用户自设的 sqlite_home 原样保留）。
-pub fn strip_codex_unified_state_home(config_text: &str) -> Result<String, AppError> {
-    let expected = normalize_sqlite_home(&crate::codex_unified_storage::state_dir());
-    let mut doc = config_text
-        .parse::<DocumentMut>()
-        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
-    let should_strip = doc
-        .get("sqlite_home")
-        .and_then(|item| item.as_str())
-        .map(normalize_sqlite_home_str)
-        .as_deref()
-        == Some(expected.as_str());
-    if should_strip {
-        doc.as_table_mut().remove("sqlite_home");
-        return Ok(doc.to_string());
-    }
-    Ok(config_text.to_string())
-}
-
-/// Backfill helper: 从 live `{ auth, config }` 设置对象中剥离统一存储注入的
-/// `sqlite_home`，避免污染 DB 里的供应商存储配置。
-pub fn strip_codex_unified_state_home_from_settings(
-    settings: &mut Value,
-) -> Result<(), AppError> {
-    let Some(config_text) = settings
-        .get("config")
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-    else {
-        return Ok(());
-    };
-    let stripped = strip_codex_unified_state_home(&config_text)?;
-    if stripped != config_text {
-        if let Some(obj) = settings.as_object_mut() {
-            obj.insert("config".to_string(), Value::String(stripped));
-        }
-    }
-    Ok(())
-}
-
-/// Windows 反斜杠在 TOML basic string 里需要转义，统一转成正斜杠（Codex
-/// 的路径解析在 Windows 上同样接受正斜杠）。
-fn normalize_sqlite_home(path: &std::path::Path) -> String {
-    normalize_sqlite_home_str(&path.to_string_lossy())
-}
-
-fn normalize_sqlite_home_str(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if cfg!(windows) {
-        trimmed.replace('\\', "/")
-    } else {
-        trimmed.to_string()
-    }
-}
-
 /// Backfill helper: strip `[mcp_servers]` from a live `{ auth, config }`
 /// settings object before it is stored back to the DB.
 ///
@@ -4375,6 +4482,320 @@ enabled = true
         let merged = merge_codex_plugin_sections(existing, new_config).expect("merge");
         let parsed: toml::Value = toml::from_str(&merged).expect("parse merged");
         assert!(parsed.get("plugins").is_none());
+    }
+
+    #[test]
+    fn merge_app_level_config_carries_shared_keys_and_tables() {
+        let existing = r#"model_provider = "old"
+model = "gpt-5.4"
+sqlite_home = "C:/Users/test/.cc-switch/codex/state"
+model_context_window = 200_000
+web_search = "live"
+
+[model_providers.old]
+name = "Old"
+base_url = "https://old.example/v1"
+
+[tui]
+notifications = false
+theme = "dark"
+
+[approval_policy]
+allow = ["Bash(git*)"]
+"#;
+        let new_config = r#"model_provider = "new"
+model = "gpt-5.5"
+
+[model_providers.new]
+name = "New"
+base_url = "https://new.example/v1"
+"#;
+
+        let merged =
+            merge_codex_app_level_config(existing, new_config).expect("merge app-level config");
+        let parsed: toml::Value = toml::from_str(&merged).expect("parse merged");
+
+        // Provider-owned keys come from the new config.
+        assert_eq!(
+            parsed.get("model_provider").and_then(toml::Value::as_str),
+            Some("new")
+        );
+        assert_eq!(
+            parsed.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert!(parsed.get("model_providers").is_some());
+        assert!(parsed["model_providers"].get("old").is_none());
+
+        // App-level shared keys are carried over.
+        assert_eq!(
+            parsed.get("sqlite_home").and_then(toml::Value::as_str),
+            Some("C:/Users/test/.cc-switch/codex/state")
+        );
+        assert_eq!(
+            parsed
+                .get("model_context_window")
+                .and_then(toml::Value::as_integer),
+            Some(200_000)
+        );
+        assert_eq!(
+            parsed.get("web_search").and_then(toml::Value::as_str),
+            Some("live"),
+            "a user's legacy web_search value is migrated and kept as app-level config"
+        );
+        assert_eq!(
+            parsed["tui"]
+                .get("notifications")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["tui"].get("theme").and_then(toml::Value::as_str),
+            Some("dark")
+        );
+        assert_eq!(
+            parsed["approval_policy"]["allow"][0].as_str(),
+            Some("Bash(git*)")
+        );
+    }
+
+    #[test]
+    fn merge_app_level_config_never_carries_provider_owned_keys() {
+        let existing = r#"model_provider = "old"
+model = "gpt-4o"
+base_url = "https://old.example/v1"
+experimental_bearer_token = "sk-old-secret"
+model_catalog_json = "cc-switch-model-catalog.json"
+web_search = "disabled"
+
+[model_providers.old]
+name = "Old"
+base_url = "https://old.example/v1"
+experimental_bearer_token = "sk-old-table-secret"
+
+[mcp_servers.echo]
+command = "npx"
+args = ["echo-server"]
+"#;
+        let new_config = r#"model_provider = "new"
+model = "gpt-5.5"
+
+[model_providers.new]
+name = "New"
+base_url = "https://new.example/v1"
+"#;
+
+        let merged =
+            merge_codex_app_level_config(existing, new_config).expect("merge app-level config");
+        let parsed: toml::Value = toml::from_str(&merged).expect("parse merged");
+
+        assert_eq!(
+            parsed.get("model_provider").and_then(toml::Value::as_str),
+            Some("new")
+        );
+        assert_eq!(
+            parsed.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert!(parsed["model_providers"].get("old").is_none());
+        assert!(parsed.get("experimental_bearer_token").is_none());
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert!(
+            parsed.get("web_search").is_none(),
+            "cc-switch's disabled sentinel must not leak across routes"
+        );
+        assert!(
+            parsed.get("mcp_servers").is_none(),
+            "MCP is DB-managed and re-projected on switch"
+        );
+        assert_eq!(
+            parsed["model_providers"]["new"]["base_url"]
+                .as_str()
+                .unwrap_or_default(),
+            "https://new.example/v1"
+        );
+    }
+
+    #[test]
+    fn merge_app_level_config_new_config_wins_and_missing_keys_carried() {
+        let existing = r#"sqlite_home = "C:/state"
+model_context_window = 64_000
+
+[tui]
+notifications = false
+theme = "dark"
+"#;
+        let new_config = r#"model_provider = "new"
+model = "gpt-5.5"
+
+[tui]
+notifications = true
+"#;
+
+        let merged =
+            merge_codex_app_level_config(existing, new_config).expect("merge app-level config");
+        let parsed: toml::Value = toml::from_str(&merged).expect("parse merged");
+
+        assert_eq!(
+            parsed["tui"]
+                .get("notifications")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "the new config's own [tui] wins over the existing live file"
+        );
+        assert_eq!(
+            parsed["tui"].get("theme").and_then(toml::Value::as_str),
+            Some("dark"),
+            "app-level keys missing from the new config are still carried"
+        );
+        assert_eq!(
+            parsed.get("sqlite_home").and_then(toml::Value::as_str),
+            Some("C:/state")
+        );
+        assert_eq!(
+            parsed
+                .get("model_context_window")
+                .and_then(toml::Value::as_integer),
+            Some(64_000)
+        );
+    }
+
+    #[test]
+    fn merge_app_level_config_tolerates_invalid_existing_config() {
+        let merged =
+            merge_codex_app_level_config("[broken", "model = \"gpt-5.5\"\n").expect("merge");
+        assert_eq!(merged, "model = \"gpt-5.5\"\n");
+    }
+
+    #[test]
+    #[serial]
+    fn read_codex_config_text_repairs_legacy_web_search_on_disk() {
+        let dir = tempfile::TempDir::new().expect("create temp home");
+        let original_home = std::env::var("HOME").ok();
+        let original_userprofile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("USERPROFILE", dir.path());
+        crate::settings::reload_settings().expect("reload settings");
+
+        let config_path = get_codex_config_path();
+        let legacy = r#"web_search = "enabled"
+
+[plugins.example]
+enabled = true
+"#;
+        write_text_file(&config_path, legacy).expect("seed legacy config");
+
+        let read = read_codex_config_text().expect("read and migrate config");
+        let persisted = std::fs::read_to_string(&config_path).expect("read migrated file");
+        for text in [&read, &persisted] {
+            let parsed: toml::Value = toml::from_str(text).expect("parse migrated config");
+            assert_eq!(
+                parsed.get("web_search").and_then(toml::Value::as_str),
+                Some("live")
+            );
+            assert_eq!(
+                parsed["plugins"]["example"]
+                    .get("enabled")
+                    .and_then(toml::Value::as_bool),
+                Some(true)
+            );
+        }
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("reset settings");
+    }
+
+    #[test]
+    #[serial]
+    fn live_write_merges_app_level_config_from_existing_file() {
+        let dir = tempfile::TempDir::new().expect("create temp home");
+        let original_home = std::env::var("HOME").ok();
+        let original_userprofile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("USERPROFILE", dir.path());
+        crate::settings::reload_settings().expect("reload settings");
+
+        let codex_dir = get_codex_config_dir();
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+        let existing = r#"model_provider = "old"
+model = "gpt-4o"
+sqlite_home = "C:/Users/test/.cc-switch/codex/state"
+web_search = "enabled"
+
+[model_providers.old]
+name = "Old"
+base_url = "https://old.example/v1"
+
+[tui]
+notifications = false
+
+[plugins]
+my-plugin = { path = "~/.codex/plugins/my-plugin" }
+"#;
+        write_text_file(&get_codex_config_path(), existing).expect("seed existing live config");
+
+        let new_config = r#"model_provider = "new"
+model = "gpt-5.5"
+
+[model_providers.new]
+name = "New"
+base_url = "https://new.example/v1"
+"#;
+        write_codex_live_atomic(&json!({ "OPENAI_API_KEY": "sk-new" }), Some(new_config))
+            .expect("write live config for new provider");
+
+        let live = std::fs::read_to_string(get_codex_config_path()).expect("read live config");
+        let parsed: toml::Value = toml::from_str(&live).expect("parse live config");
+
+        // Provider-owned keys switched to the new provider...
+        assert_eq!(
+            parsed.get("model_provider").and_then(toml::Value::as_str),
+            Some("new")
+        );
+        assert_eq!(
+            parsed.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert!(parsed["model_providers"].get("old").is_none());
+
+        // ...while app-level shared config is unified across the switch.
+        assert_eq!(
+            parsed.get("sqlite_home").and_then(toml::Value::as_str),
+            Some("C:/Users/test/.cc-switch/codex/state")
+        );
+        assert_eq!(
+            parsed.get("web_search").and_then(toml::Value::as_str),
+            Some("live")
+        );
+        assert_eq!(
+            parsed["tui"]
+                .get("notifications")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            parsed.get("plugins").is_some(),
+            "user-installed plugin registrations must survive the switch"
+        );
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("reset settings");
     }
 
     #[test]
@@ -5328,6 +5749,78 @@ base_url = "https://production.api/v1"
     }
 
     #[test]
+    fn aggregate_catalog_adds_provider_separator_to_each_groups_first_model() {
+        let mut deepseek = Provider::with_id(
+            "deepseek-provider".to_string(),
+            "DeepSeek".to_string(),
+            json!({ "apiFormat": "openai_responses" }),
+            None,
+        );
+        deepseek.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        let mut glm = Provider::with_id(
+            "glm-provider".to_string(),
+            "GLM".to_string(),
+            json!({ "apiFormat": "openai_responses" }),
+            None,
+        );
+        glm.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        let settings = json!({
+            "codexCustomModels": [
+                {
+                    "model": "deepseek-v4",
+                    "providerId": "deepseek-provider",
+                    "upstreamModel": "deepseek-v4",
+                    "displayName": "DeepSeek V4"
+                },
+                {
+                    "model": "deepseek-v3",
+                    "providerId": "deepseek-provider",
+                    "upstreamModel": "deepseek-v3",
+                    "displayName": "DeepSeek V3"
+                },
+                {
+                    "model": "glm-5",
+                    "providerId": "glm-provider",
+                    "upstreamModel": "glm-5",
+                    "displayName": "GLM-5"
+                }
+            ]
+        });
+        let resolve_provider = |provider_id: &str| match provider_id {
+            "deepseek-provider" => Some(deepseek.clone()),
+            "glm-provider" => Some(glm.clone()),
+            _ => None,
+        };
+
+        let entries = codex_custom_catalog_entries(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+            Some(&resolve_provider),
+        )
+        .expect("build provider-grouped catalog entries");
+
+        assert_eq!(
+            entries[0].get("display_name").and_then(Value::as_str),
+            Some("------ DeepSeek ------  DeepSeek V4")
+        );
+        assert_eq!(
+            entries[1].get("display_name").and_then(Value::as_str),
+            Some("DeepSeek V3")
+        );
+        assert_eq!(
+            entries[2].get("display_name").and_then(Value::as_str),
+            Some("------ GLM ------  GLM-5")
+        );
+    }
+
+    #[test]
     fn aggregate_catalog_preserves_bound_providers_official_vendor_capabilities() {
         let mut provider = Provider::with_id(
             "deepseek-provider".to_string(),
@@ -5363,7 +5856,10 @@ base_url = "https://production.api/v1"
 
         let entry = &entries[0];
         assert_eq!(entry.get("slug"), Some(&json!("gpt-5.2")));
-        assert_eq!(entry.get("display_name"), Some(&json!("gpt-5.2")));
+        assert_eq!(
+            entry.get("display_name"),
+            Some(&json!("------ DeepSeek Provider ------  gpt-5.2"))
+        );
         assert_eq!(entry.get("apply_patch_tool_type"), Some(&json!("freeform")));
         assert!(entry
             .get("base_instructions")
@@ -5650,7 +6146,7 @@ base_url = "https://production.api/v1"
         assert_eq!(entries[0].get("slug"), Some(&json!("gpt-5.2")));
         assert_eq!(
             entries[0].get("input_modalities"),
-            Some(&json!(["text"])),
+            Some(&json!(["text", "image"])),
             "capabilities must follow the routed upstream model, not the public slot"
         );
     }
@@ -5689,7 +6185,7 @@ base_url = "https://production.api/v1"
 
         assert_eq!(
             entries[0].get("input_modalities"),
-            Some(&json!(["text"])),
+            Some(&json!(["text", "image"])),
             "an omitted upstream override must inherit the bound provider's routed model"
         );
     }
@@ -5808,12 +6304,16 @@ base_url = "https://production.api/v1"
             };
 
             assert_eq!(modalities("gpt-5.4"), json!(["text", "image"]));
-            assert_eq!(modalities("deepseek/deepseek-v4-pro"), json!(["text"]));
+            assert_eq!(
+                modalities("deepseek/deepseek-v4-pro"),
+                json!(["text", "image"]),
+                "DeepSeek V4 accepts image input and must fail open"
+            );
             assert_eq!(modalities("glm-5.2v"), json!(["text", "image"]));
             assert_eq!(
                 modalities("deepseek-v4-flash"),
                 json!(["text", "image"]),
-                "explicit provider metadata must override the text-only registry"
+                "explicit provider metadata must win over inferred capabilities"
             );
             assert_eq!(modalities("custom-text-alias"), json!(["text"]));
         }
@@ -5916,7 +6416,10 @@ wire_api = "responses"
             flash.get("supports_reasoning_summaries"),
             Some(&json!(true))
         );
-        assert_eq!(flash.get("input_modalities"), Some(&json!(["text"])));
+        assert_eq!(
+            flash.get("input_modalities"),
+            Some(&json!(["text", "image"]))
+        );
         assert!(
             flash.get("model_messages").is_some(),
             "official entries are mirrored verbatim, incl. model_messages"
@@ -6110,6 +6613,48 @@ name = "any"
     }
 
     #[test]
+    fn normalize_codex_config_migrates_legacy_web_search_without_touching_plugins() {
+        let input = r#"web_search = "enabled"
+
+[plugins.example]
+enabled = true
+"#;
+        let normalized = normalize_codex_config_text(input).expect("normalize config");
+        let parsed: toml::Value = toml::from_str(&normalized).expect("parse normalized config");
+
+        assert_eq!(
+            parsed.get("web_search").and_then(toml::Value::as_str),
+            Some("live")
+        );
+        assert_eq!(
+            parsed["plugins"]["example"]
+                .get("enabled")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "plugin enabled flags must not be mistaken for Codex web_search"
+        );
+    }
+
+    #[test]
+    fn normalize_codex_config_keeps_current_web_search_modes() {
+        for mode in ["disabled", "cached", "indexed", "live"] {
+            let input = format!("web_search = \"{mode}\"\n");
+            let normalized = normalize_codex_config_text(&input).expect("normalize config");
+            let parsed: toml::Value = toml::from_str(&normalized).expect("parse config");
+            assert_eq!(
+                parsed.get("web_search").and_then(toml::Value::as_str),
+                Some(mode)
+            );
+        }
+    }
+
+    #[test]
+    fn validate_config_toml_accepts_legacy_web_search_mode() {
+        validate_config_toml("web_search = \"enabled\"\n")
+            .expect("legacy web_search should be migrated before validation");
+    }
+
+    #[test]
     fn native_web_search_field_disables_at_top_level() {
         // Native `/responses` gateways reject the web_search tool, so the
         // NativeResponses profile must write the top-level disable line even
@@ -6151,17 +6696,17 @@ web_search = "disabled"
     }
 
     #[test]
-    fn native_web_search_field_preserves_user_value() {
-        // A user's own web_search value must never be clobbered by cleanup,
-        // only cc-switch's "disabled" sentinel is owned/removable.
+    fn native_web_search_field_migrates_legacy_user_value() {
+        // A user's old enabled preference remains enabled semantically, but is
+        // emitted using the enum accepted by current Codex.
         let input = r#"web_search = "enabled"
 "#;
         let result = set_codex_native_web_search_field(input, false).unwrap();
         let parsed: toml::Value = toml::from_str(&result).unwrap();
         assert_eq!(
             parsed.get("web_search").and_then(|value| value.as_str()),
-            Some("enabled"),
-            "a user-set web_search value must be preserved"
+            Some("live"),
+            "legacy enabled mode must be migrated without disabling search"
         );
     }
 
@@ -6391,19 +6936,19 @@ web_search = "disabled"
             models[0].get("inputModalities").is_none(),
             "GPT text+image is inferred and must not become a sticky hidden override"
         );
-        assert!(
-            models[1].get("inputModalities").is_none(),
-            "confirmed text-only capability is inferred and must remain registry-driven"
+        assert_eq!(
+            models[1].get("inputModalities"),
+            Some(&json!(["text"])),
+            "explicit text-only override must round-trip for an image-capable model"
         );
         assert_eq!(
             models[2].get("inputModalities"),
             Some(&json!(["text"])),
             "an unknown model explicitly forced to text-only must round-trip"
         );
-        assert_eq!(
-            models[3].get("inputModalities"),
-            Some(&json!(["text", "image"])),
-            "an explicit image override for a registered text-only model must round-trip"
+        assert!(
+            models[3].get("inputModalities").is_none(),
+            "default image support is inferred and must not become a sticky hidden override"
         );
     }
 

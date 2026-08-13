@@ -71,10 +71,6 @@ pub(crate) fn is_confirmed_text_only_model(model: &str) -> bool {
 
     const CONFIRMED_TAILS: &[&str] = &[
         "ark-code-latest",
-        "deepseek-chat",
-        "deepseek-reasoner",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
         "glm-5.1",
         // Exact rather than prefix matching: GLM visual models use a `v`
         // suffix (for example glm-5.2v), which must remain image-capable.
@@ -98,7 +94,6 @@ pub(crate) fn is_confirmed_text_only_model(model: &str) -> bool {
         "qwen3-coder-plus",
         "step-3.5-flash",
         "step-3.5-flash-2603",
-        "us.deepseek.r1-v1",
     ];
 
     CONFIRMED_TAILS.contains(&tail)
@@ -215,7 +210,6 @@ mod tests {
 
     #[test]
     fn confirmed_text_only_registry_normalizes_namespaces_and_context_markers() {
-        assert!(is_confirmed_text_only_model("deepseek/deepseek-v4-pro"));
         assert!(is_confirmed_text_only_model("GLM-5.2[1M]"));
         assert!(is_confirmed_text_only_model("qwen/qwen3-coder-plus"));
         assert!(is_confirmed_text_only_model(
@@ -224,6 +218,24 @@ mod tests {
         assert!(is_confirmed_text_only_model("MiniMax-M2.7-Highspeed"));
         assert!(is_confirmed_text_only_model("step-3.5-flash-2603"));
         assert!(!is_confirmed_text_only_model("glm-5.2v"));
+    }
+
+    #[test]
+    fn deepseek_models_fail_open_for_image_input() {
+        // DeepSeek V4 系列（含 legacy 别名与 Vertex 部署的 R1）均按官方
+        // 模型目录声明支持图片输入，不再被当作纯文本模型拦截。
+        for model in [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-v4-flash",
+            "deepseek/deepseek-v4-pro",
+            "us.deepseek.r1-v1",
+        ] {
+            assert!(
+                !is_confirmed_text_only_model(model),
+                "DeepSeek model {model} must not be hard-gated as text-only"
+            );
+        }
     }
 
     #[test]
