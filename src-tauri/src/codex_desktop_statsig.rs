@@ -14,15 +14,6 @@
 //! overwrite it. A background worker retries while the Desktop holds the LevelDB
 //! lock and renews the pin so the custom ids survive long sessions.
 //!
-//! The pin is applied to every evaluation cache entry that carries the models
-//! dynamic config, including entries that bundle unrelated gates/configs. The
-//! Desktop's real evaluation cache is almost never isolated to the models
-//! config, so refusing to pin shared bundles made the injected ids disappear as
-//! soon as the SDK refreshed (and cc-switch cannot re-inject while the Desktop
-//! holds the LevelDB lock). Pinning a shared bundle keeps unrelated
-//! evaluations at the pinned snapshot until the provider changes back to a
-//! non-custom catalog (Reconcile unpins) or the horizon expires.
-//!
 //! This is a best-effort, fail-open integration: absent, locked, or unsupported
 //! Desktop storage is logged and never blocks provider switching.
 
@@ -601,21 +592,17 @@ fn sync_codex_desktop_available_models_cache_path_with_mode(
                 .entry(origin.clone())
                 .or_default()
                 .insert(cache_key.clone());
+            if !model_ids.is_empty() && !models_config_isolated {
+                requires_short_retry = true;
+                unpinned_cache_keys_by_origin
+                    .entry(origin.clone())
+                    .or_default()
+                    .insert(cache_key.clone());
+            }
         }
         let changed = merge_codex_desktop_statsig_available_models(&mut wrapper, model_ids);
         let has_all_models =
             !model_ids.is_empty() && codex_desktop_statsig_has_all_models(&wrapper, model_ids);
-        // Shared bundles that are not yet fully merged still need short
-        // maintenance retries so the injected ids are restored as soon as the
-        // Desktop releases the LevelDB lock. Once every id is present the
-        // bundle is pinned and no longer needs aggressive retries.
-        if !model_ids.is_empty() && !models_config_isolated && !has_all_models {
-            requires_short_retry = true;
-            unpinned_cache_keys_by_origin
-                .entry(origin.clone())
-                .or_default()
-                .insert(cache_key.clone());
-        }
         if changed {
             let Some(updated) = encode_codex_desktop_statsig_wrapper(prefix, encoding, &wrapper)
             else {
@@ -623,7 +610,7 @@ fn sync_codex_desktop_available_models_cache_path_with_mode(
             };
             updates.push((key, updated));
         }
-        if has_all_models {
+        if has_all_models && models_config_isolated {
             pinned_cache_keys_by_origin
                 .entry(origin)
                 .or_default()
@@ -1322,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_desktop_statsig_has_only_models_config_detects_shared_bundles() {
+    fn codex_desktop_statsig_pin_rejects_sibling_evaluation_collections() {
         let data = json!({
             "dynamic_configs": {
                 CODEX_DESKTOP_STATSIG_MODELS_CONFIG_ID: {
@@ -1339,7 +1326,7 @@ mod tests {
 
         assert!(
             !codex_desktop_statsig_has_only_models_config(&wrapper),
-            "shared evaluation bundles must be detected so sync can keep maintaining them"
+            "evaluation bundles with sibling collections must not be future-pinned"
         );
     }
 
@@ -1430,17 +1417,14 @@ mod tests {
             &["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()],
         )
         .expect("sync temp leveldb");
-        assert_eq!(
-            result.updated_count, 2,
-            "the merged evaluations entry and its pinned last-modified timestamp are both updated"
+        assert_eq!(result.updated_count, 1);
+        assert!(
+            !result.ready_model_cache,
+            "a shared dynamic-config bundle must not be treated as safely pinned"
         );
         assert!(
-            result.ready_model_cache,
-            "a shared dynamic-config bundle with every model present must be pinned so the Desktop SDK does not overwrite the injected ids"
-        );
-        assert!(
-            !result.requires_short_retry,
-            "a fully merged shared bundle is pinned and no longer needs short maintenance retries"
+            result.requires_short_retry,
+            "a shared dynamic-config bundle needs short maintenance retries"
         );
 
         let options = rusty_leveldb::Options {
@@ -1469,12 +1453,9 @@ mod tests {
             .expect("read updated last modified cache");
         let (_, _, last_modified) =
             decode_codex_desktop_statsig_wrapper(&last_modified_value).unwrap();
-        let pinned = last_modified["statsig.cached.evaluations.active"]
-            .as_i64()
-            .expect("pinned last modified timestamp");
-        assert!(
-            pinned > 1_000,
-            "the shared bundle must be pinned into the future so the SDK keeps the injected models"
+        assert_eq!(
+            last_modified["statsig.cached.evaluations.active"].as_i64(),
+            Some(1_000)
         );
         db.close().expect("close leveldb");
     }
