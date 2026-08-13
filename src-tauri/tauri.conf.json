@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "CC Switch",
+  "productName": "CC Switch-KP",
   "version": "3.19.2",
   "identifier": "com.ccswitch.desktop",
   "build": {

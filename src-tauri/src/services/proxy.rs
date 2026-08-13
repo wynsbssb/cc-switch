@@ -24,7 +24,7 @@ const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 
 /// 代理接管模式下需要从 Claude Live 配置中移除的"模型覆盖"字段。
 ///
-/// 原因：接管模式下 `*_MODEL` 必须由 CC Switch 写成稳定的 Claude 角色别名，
+/// 原因：接管模式下 `*_MODEL` 必须由 CC Switch-KP 写成稳定的 Claude 角色别名，
 /// 再由本地代理映射到当前供应商真实模型；`*_MODEL_NAME` 也需要同步接管，
 /// 否则 Claude Code 模型菜单会残留上一个供应商的显示名称。
 const CLAUDE_MODEL_OVERRIDE_ENV_KEYS: [&str; 12] = [
@@ -2092,6 +2092,11 @@ impl ProxyService {
                 );
             } else {
                 self.write_live_config_for_app(app_type, &config)?;
+                if app_type == &AppType::Codex {
+                    crate::codex_desktop_statsig::sync_codex_desktop_available_models_cache_after_live_restore(
+                        &config,
+                    );
+                }
                 log::info!("{app_type_str} Live 配置已从备份恢复");
                 return Ok(());
             }
@@ -3215,6 +3220,10 @@ impl ProxyService {
             };
             crate::codex_config::write_codex_live_config_atomic(Some(&live_config))
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+            crate::codex_desktop_statsig::sync_codex_desktop_available_models_cache_after_provider_write(
+                config,
+                Some(&live_config),
+            );
             return Ok(());
         }
 

@@ -1,6 +1,6 @@
 use std::fs;
 
-use cc_switch_lib::{
+use cc_switch_kp_lib::{
     migrate_skills_to_ssot, AppType, ImportSkillSelection, InstalledSkill, SkillApps, SkillService,
 };
 

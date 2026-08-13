@@ -20,7 +20,7 @@ use toml_edit::DocumentMut;
 
 pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
 /// Temporary model-provider id used while the built-in `codex-official`
-/// provider is routed through CC Switch.  A dedicated id is an ownership
+/// provider is routed through CC Switch-KP.  A dedicated id is an ownership
 /// marker: unlike a generic localhost `base_url`, it can be detected and
 /// cleaned up without mistaking a user's own local provider for takeover.
 pub const CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID: &str = "cc-switch-official";
@@ -258,6 +258,16 @@ pub fn get_codex_model_catalog_path() -> PathBuf {
     get_codex_config_dir().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
 }
 
+/// Windows/macOS filesystems are case-insensitive, and a user-edited or
+/// legacy `model_catalog_json` may reference the cc-switch catalog with
+/// different casing (e.g. `CC-SWITCH-MODEL-CATALOG.JSON`). Match the filename
+/// ignoring ASCII case so cc-switch still recognizes its own catalog file.
+fn is_cc_switch_catalog_filename(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME))
+}
+
 /// 获取 Codex 供应商配置文件路径
 #[allow(dead_code)]
 pub fn get_codex_provider_paths(
@@ -320,6 +330,12 @@ pub fn write_codex_live_atomic(
     if !cfg_text.trim().is_empty() {
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
+
+    // Preserve the ChatGPT/Codex plugin registrations ([plugins] /
+    // [marketplaces]) already present on disk, same as the config-only
+    // writer above, so provider switches never wipe user-installed plugins.
+    let existing_config = read_codex_config_text().unwrap_or_default();
+    let cfg_text = merge_codex_plugin_sections(&existing_config, &cfg_text)?;
 
     // 第一步：写 auth.json
     write_json_file(&auth_path, auth)?;
@@ -397,7 +413,61 @@ pub fn write_codex_live_config_atomic(config_text_opt: Option<&str>) -> Result<(
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
 
-    write_text_file(&config_path, &cfg_text)
+    // Preserve the ChatGPT/Codex plugin registrations ([plugins] /
+    // [marketplaces]) already present on disk: overwriting config.toml
+    // without them makes user-installed plugins vanish after an app restart.
+    let existing_config = read_codex_config_text().unwrap_or_default();
+    let merged = merge_codex_plugin_sections(&existing_config, &cfg_text)?;
+    write_text_file(&config_path, &merged)
+}
+
+/// Merge the ChatGPT/Codex plugin state ([plugins] / [marketplaces])
+/// from an existing config.toml into a freshly generated one.
+///
+/// cc-switch rebuilds ~/.codex/config.toml on provider switches, startup
+/// sync, and live-config sync from its own DB. Those rewrites historically
+/// dropped the [plugins] / [marketplaces] tables that the ChatGPT/Codex
+/// app uses to keep user-installed plugins registered, so plugins vanished
+/// after the app restarted. This function carries those tables over on every
+/// write so plugin state survives ("auto-sync").
+///
+/// A missing/unreadable/invalid existing file is tolerated and returns the
+/// new config unchanged; the new config stays authoritative when it already
+/// declares its own plugins / marketplaces tables.
+pub fn merge_codex_plugin_sections(
+    existing_config: &str,
+    new_config: &str,
+) -> Result<String, AppError> {
+    if existing_config.trim().is_empty() {
+        return Ok(new_config.to_string());
+    }
+
+    let mut existing = match existing_config.parse::<DocumentMut>() {
+        Ok(doc) => doc,
+        Err(_) => return Ok(new_config.to_string()),
+    };
+
+    if !existing.contains_key("plugins") && !existing.contains_key("marketplaces") {
+        return Ok(new_config.to_string());
+    }
+
+    let mut target = match new_config.parse::<DocumentMut>() {
+        Ok(doc) => doc,
+        Err(e) => {
+            return Err(AppError::Message(format!("Invalid Codex config.toml: {e}")));
+        }
+    };
+
+    for key in ["plugins", "marketplaces"] {
+        let Some(item) = existing.remove(key) else {
+            continue;
+        };
+        if item.is_table_like() && !target.contains_key(key) {
+            target[key] = item;
+        }
+    }
+
+    Ok(target.to_string())
 }
 
 pub fn extract_codex_auth_api_key(auth: &Value) -> Option<String> {
@@ -633,6 +703,62 @@ fn codex_catalog_input_modalities_from_capability(capability: ImageInputCapabili
     modalities.iter().map(|item| (*item).to_string()).collect()
 }
 
+/// Codex >= 0.144 (desktop app-server protocol and some catalog readers) parses
+/// model entries with camelCase field names (`displayName`,
+/// `supportedReasoningEfforts`, `defaultReasoningEffort`, `contextWindow`, ...),
+/// while the CLI (`codex-rs` `ModelInfo`) reads snake_case. Emit BOTH spellings
+/// in every generated entry so one catalog file satisfies every consumer. The
+/// extra keys are harmless: neither parser enables `deny_unknown_fields`.
+fn codex_catalog_add_camel_case_aliases(entry: &mut Value) {
+    let Some(entry_obj) = entry.as_object_mut() else {
+        return;
+    };
+    let mut copy_key = |dst: &str, src: &str| {
+        if !entry_obj.contains_key(dst) {
+            if let Some(value) = entry_obj.get(src).cloned() {
+                entry_obj.insert(dst.to_string(), value);
+            }
+        }
+    };
+
+    copy_key("displayName", "display_name");
+    copy_key("contextWindow", "context_window");
+    copy_key("maxContextWindow", "max_context_window");
+    copy_key("defaultReasoningEffort", "default_reasoning_level");
+    copy_key("inputModalities", "input_modalities");
+    copy_key("baseInstructions", "base_instructions");
+    copy_key("supportsParallelToolCalls", "supports_parallel_tool_calls");
+    copy_key("additionalSpeedTiers", "additional_speed_tiers");
+    copy_key("serviceTiers", "service_tiers");
+    copy_key("availabilityNux", "availability_nux");
+
+    // supported_reasoning_levels: [{effort, description}] -> camelCase:
+    // supportedReasoningEfforts: [{reasoningEffort, description}]
+    if !entry_obj.contains_key("supportedReasoningEfforts") {
+        let efforts: Vec<Value> = entry_obj
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .map(|levels| {
+                levels
+                    .iter()
+                    .filter_map(|level| {
+                        let effort = level.get("effort")?.clone();
+                        let mut item = serde_json::Map::new();
+                        item.insert("reasoningEffort".to_string(), effort);
+                        if let Some(description) = level.get("description").cloned() {
+                            item.insert("description".to_string(), description);
+                        }
+                        Some(Value::Object(item))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !efforts.is_empty() {
+            entry_obj.insert("supportedReasoningEfforts".to_string(), json!(efforts));
+        }
+    }
+}
+
 fn codex_catalog_model_entry(
     template: &Value,
     spec: &CodexCatalogModelSpec,
@@ -705,6 +831,7 @@ fn codex_catalog_model_entry(
         }
     }
 
+    codex_catalog_add_camel_case_aliases(&mut entry);
     entry
 }
 
@@ -1527,7 +1654,7 @@ fn detect_codex_cli_client_version() -> Option<String> {
 
 /// Resolve the client version used by Codex to validate `models_cache.json`.
 /// Prefer a live CLI/Desktop binary; an existing cache is only a fallback for
-/// installations whose executable cannot be launched from CC Switch.
+/// installations whose executable cannot be launched from CC Switch-KP.
 pub(crate) fn resolve_codex_client_version() -> Option<String> {
     detect_codex_cli_client_version().or_else(|| {
         fs::read_to_string(get_codex_config_dir().join("models_cache.json"))
@@ -2098,6 +2225,10 @@ fn codex_vendor_catalog_model_entry(
     // Defensive: if a future codex parser requires a field the vendor file
     // predates, backfill only whitelisted parser-required keys.
     fill_template_fields_from_static(&mut entry);
+
+    // Codex >= 0.144 desktop reads camelCase aliases; the CLI reads snake_case.
+    // Emit both so a single generated entry satisfies every consumer.
+    codex_catalog_add_camel_case_aliases(&mut entry);
     entry
 }
 
@@ -2395,10 +2526,7 @@ fn set_codex_model_catalog_json_field(
             let is_cc_switch_owned = doc
                 .get("model_catalog_json")
                 .and_then(|item| item.as_str())
-                .map(|path| {
-                    Path::new(path).file_name().and_then(|name| name.to_str())
-                        == Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
-                })
+                .map(|path| is_cc_switch_catalog_filename(Path::new(path)))
                 .unwrap_or(true);
             if is_cc_switch_owned {
                 doc["model_catalog_json"] =
@@ -2409,10 +2537,7 @@ fn set_codex_model_catalog_json_field(
             let should_remove = doc
                 .get("model_catalog_json")
                 .and_then(|item| item.as_str())
-                .map(|path| {
-                    Path::new(path).file_name().and_then(|name| name.to_str())
-                        == Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
-                })
+                .map(|path| is_cc_switch_catalog_filename(Path::new(path)))
                 .unwrap_or(false);
             if should_remove {
                 doc.as_table_mut().remove("model_catalog_json");
@@ -2583,8 +2708,7 @@ pub(crate) fn resolve_cc_switch_catalog_path(
         .filter(|s| !s.is_empty())?;
 
     let referenced_path = Path::new(catalog_path_str);
-    let is_cc_switch_owned = referenced_path.file_name().and_then(|name| name.to_str())
-        == Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+    let is_cc_switch_owned = is_cc_switch_catalog_filename(&referenced_path);
     if !is_cc_switch_owned {
         return None;
     }
@@ -2776,7 +2900,17 @@ pub fn write_codex_provider_live_with_catalog(
         })
         .transpose()?;
 
-    write_codex_live_for_provider(category, auth, prepared_config.as_deref())
+    write_codex_live_for_provider(category, auth, prepared_config.as_deref())?;
+
+    // Keep the Codex Desktop Statsig `available_models` whitelist in sync so the
+    // configured catalog models show in the Desktop model picker instead of the
+    // raw id as "???/Custom".
+    crate::codex_desktop_statsig::sync_codex_desktop_available_models_cache_after_provider_write(
+        settings,
+        prepared_config.as_deref(),
+    );
+
+    Ok(())
 }
 
 /// Extract a provider-scoped `experimental_bearer_token` from Codex `config.toml`.
@@ -3020,7 +3154,7 @@ pub fn apply_codex_official_proxy_route_with_auth(
         }
     };
 
-    // Clean only CC Switch's placeholder from every stale provider table. Real
+    // Clean only CC Switch-KP's placeholder from every stale provider table. Real
     // user bearer tokens are preserved, as are all unrelated provider fields.
     remove_codex_proxy_placeholders_from_providers(&mut providers);
 
@@ -3042,7 +3176,7 @@ pub fn apply_codex_official_proxy_route_with_auth(
     Ok(doc.to_string())
 }
 
-/// Whether a live Codex config is the official route projected by CC Switch.
+/// Whether a live Codex config is the official route projected by CC Switch-KP.
 pub fn codex_config_has_official_proxy_route(config_text: &str) -> bool {
     if !config_text.contains(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID) {
         return false;
@@ -3059,7 +3193,7 @@ pub fn codex_config_has_official_proxy_route(config_text: &str) -> bool {
         == Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
 }
 
-/// Remove only the official takeover route owned by CC Switch. This is a
+/// Remove only the official takeover route owned by CC Switch-KP. This is a
 /// last-resort crash cleanup when no live backup or provider SSOT is usable.
 pub fn remove_codex_official_proxy_route(config_text: &str) -> Result<String, AppError> {
     let mut doc = config_text
@@ -3815,6 +3949,96 @@ requires_openai_auth = true
             Some(original),
             "config text must be byte-identical when nothing is stripped"
         );
+    }
+
+    #[test]
+    fn merge_plugin_sections_carries_plugins_and_marketplaces_over() {
+        let existing = r#"model = "gpt-5.4"
+
+[marketplaces.echobird-cn]
+source_type = "github"
+source = "https://github.com/echobird-cn/codex-plugins"
+
+[plugins."github@echobird-cn"]
+enabled = true
+"#;
+        let new_config = r#"model_provider = "custom"
+model = "deepseek-v4-flash"
+
+[model_providers.custom]
+name = "deepseek"
+base_url = "https://api.deepseek.com"
+"#;
+
+        let merged = merge_codex_plugin_sections(existing, new_config).expect("merge");
+        let parsed: toml::Value = toml::from_str(&merged).expect("parse merged");
+
+        // Provider state from the new config is intact.
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("deepseek-v4-flash")
+        );
+
+        // Plugin/marketplace state from the existing config is preserved.
+        let marketplace = parsed
+            .get("marketplaces")
+            .and_then(|v| v.get("echobird-cn"))
+            .and_then(|v| v.get("source_type"))
+            .and_then(|v| v.as_str());
+        assert_eq!(marketplace, Some("github"));
+        let enabled = parsed
+            .get("plugins")
+            .and_then(|v| v.get("github@echobird-cn"))
+            .and_then(|v| v.get("enabled"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(enabled, Some(true));
+    }
+
+    #[test]
+    fn merge_plugin_sections_keeps_new_config_authoritative() {
+        let existing = r#"[plugins."github@echobird-cn"]
+enabled = true
+"#;
+        let new_config = r#"model = "gpt-5.4"
+
+[plugins."pdf@openai-primary-runtime"]
+enabled = true
+"#;
+        let merged = merge_codex_plugin_sections(existing, new_config).expect("merge");
+        let parsed: toml::Value = toml::from_str(&merged).expect("parse merged");
+        let plugins = parsed
+            .get("plugins")
+            .and_then(|v| v.as_table())
+            .expect("plugins table");
+
+        // New config's own plugin table wins; the existing one is not merged in.
+        assert!(plugins.contains_key("pdf@openai-primary-runtime"));
+        assert!(!plugins.contains_key("github@echobird-cn"));
+    }
+
+    #[test]
+    fn merge_plugin_sections_is_noop_without_existing_plugin_state() {
+        let existing = "model = \"gpt-5.4\"\n";
+        let new_config = "model = \"deepseek-v4-flash\"\n";
+        let merged = merge_codex_plugin_sections(existing, new_config).expect("merge");
+        assert_eq!(merged, new_config);
+    }
+
+    #[test]
+    fn merge_plugin_sections_tolerates_invalid_existing_config() {
+        let existing = "this is not [[[ valid toml";
+        let new_config = "model = \"deepseek-v4-flash\"\n";
+        let merged = merge_codex_plugin_sections(existing, new_config).expect("merge");
+        assert_eq!(merged, new_config);
+    }
+
+    #[test]
+    fn merge_plugin_sections_ignores_non_table_plugin_state() {
+        let existing = "plugins = [\"a\"]\n";
+        let new_config = "model = \"deepseek-v4-flash\"\n";
+        let merged = merge_codex_plugin_sections(existing, new_config).expect("merge");
+        let parsed: toml::Value = toml::from_str(&merged).expect("parse merged");
+        assert!(parsed.get("plugins").is_none());
     }
 
     #[test]
@@ -4810,6 +5034,114 @@ base_url = "https://production.api/v1"
             .and_then(Value::as_str)
             .is_some_and(|text| text.starts_with("You are Codex, an agent based on GPT-5")));
         assert_eq!(entry.get("context_window"), Some(&json!(1_048_576)));
+    }
+
+    #[test]
+    fn catalog_entry_emits_camel_case_aliases_for_desktop() {
+        let template = load_codex_native_responses_template();
+        let spec = CodexCatalogModelSpec {
+            model: "deepseek-v4-flash".to_string(),
+            display_name: Some("DeepSeek V4 Flash".to_string()),
+            context_window: Some(1_000_000),
+            supports_parallel_tool_calls: Some(false),
+            input_modalities: Some(vec!["text".to_string()]),
+            base_instructions: Some("You are Codex, a coding agent.".to_string()),
+        };
+        let entry = codex_catalog_model_entry(
+            &template,
+            &spec,
+            0,
+            CodexCatalogToolProfile::NativeResponses,
+            128_000,
+        );
+
+        // snake_case (CLI / codex-rs ModelInfo) must stay intact.
+        assert_eq!(entry.get("display_name"), Some(&json!("DeepSeek V4 Flash")));
+        assert_eq!(entry.get("context_window"), Some(&json!(1_000_000)));
+        assert!(entry.get("supported_reasoning_levels").is_some());
+
+        // camelCase (desktop >= 0.144 app-server protocol) must be present too.
+        assert_eq!(entry.get("displayName"), Some(&json!("DeepSeek V4 Flash")));
+        assert_eq!(entry.get("contextWindow"), Some(&json!(1_000_000)));
+        assert_eq!(entry.get("maxContextWindow"), Some(&json!(1_000_000)));
+        assert_eq!(entry.get("inputModalities"), Some(&json!(["text"])));
+        assert_eq!(
+            entry.get("defaultReasoningEffort"),
+            entry.get("default_reasoning_level"),
+        );
+        assert_eq!(entry.get("supportsParallelToolCalls"), Some(&json!(false)),);
+        let efforts = entry
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .expect("camelCase reasoning efforts must exist");
+        assert!(!efforts.is_empty());
+        assert!(
+            efforts
+                .iter()
+                .all(|level| level.get("reasoningEffort").is_some()),
+            "camelCase efforts must use the reasoningEffort key"
+        );
+        assert!(
+            efforts.iter().all(|level| level.get("effort").is_none()),
+            "camelCase efforts must not carry the snake_case effort key"
+        );
+    }
+
+    #[test]
+    fn vendor_catalog_entry_emits_camel_case_aliases() {
+        let vendor_models = load_codex_deepseek_official_catalog_models();
+        assert!(!vendor_models.is_empty());
+        let spec = CodexCatalogModelSpec {
+            model: "deepseek-v4-flash".to_string(),
+            display_name: None,
+            context_window: None,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+        };
+        let entry = codex_vendor_catalog_model_entry(&vendor_models, &spec, 0, None);
+        assert_eq!(entry.get("displayName"), entry.get("display_name"));
+        assert_eq!(entry.get("contextWindow"), entry.get("context_window"));
+        assert!(
+            entry.get("supportedReasoningEfforts").is_some(),
+            "vendor entries must expose camelCase reasoning efforts"
+        );
+    }
+
+    #[test]
+    fn resolve_catalog_accepts_case_insensitive_owned_filename() {
+        let config_text = r#"model_catalog_json = "C:/Users/me/.codex/CC-SWITCH-MODEL-CATALOG.JSON"
+"#;
+        let base_dir = PathBuf::from("C:/Users/me/.codex");
+        let result = resolve_cc_switch_catalog_path(config_text, &base_dir);
+        assert!(
+            result
+                .as_ref()
+                .is_some_and(|path| is_cc_switch_catalog_filename(path)),
+            "uppercase catalog filename must still be recognized as cc-switch-owned"
+        );
+    }
+
+    #[test]
+    fn set_catalog_json_recognizes_uppercase_owned_filename() {
+        let config_text = r#"model_catalog_json = "C:/Users/me/.codex/CC-SWITCH-MODEL-CATALOG.JSON"
+"#;
+        let result =
+            set_codex_model_catalog_json_field(config_text, Some(Path::new("ignored"))).unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        assert_eq!(
+            parsed.get("model_catalog_json").and_then(|v| v.as_str()),
+            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME),
+            "an uppercase owned filename must be normalized to the canonical name"
+        );
+
+        // None arm: the uppercase pointer is still cc-switch-owned and must be removed.
+        let result = set_codex_model_catalog_json_field(config_text, None).unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        assert!(
+            parsed.get("model_catalog_json").is_none(),
+            "removing the catalog must drop an uppercase owned pointer"
+        );
     }
 
     #[test]
@@ -7344,7 +7676,7 @@ model = "glm-5"
 
     #[test]
     fn set_catalog_json_some_preserves_user_owned_catalog() {
-        // When CC Switch generates a catalog (Some arm), it must still respect a
+        // When CC Switch-KP generates a catalog (Some arm), it must still respect a
         // user-managed external catalog file instead of clobbering it with the
         // cc-switch-owned filename. Only an absent or cc-switch-owned pointer is
         // claimed; this mirrors the None arm's ownership rule.

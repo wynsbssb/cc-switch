@@ -4,7 +4,7 @@
 
 ## How to Get Help
 
-CC Switch is an open-source project maintained by volunteers. We're happy to help, but please use the right channel so we can respond efficiently.
+CC Switch-KP is an open-source project maintained by volunteers. We're happy to help, but please use the right channel so we can respond efficiently.
 
 ### Before Asking
 
@@ -35,7 +35,7 @@ CC Switch is an open-source project maintained by volunteers. We're happy to hel
 
 ## 如何获取帮助
 
-CC Switch 是一个由志愿者维护的开源项目。我们很乐意提供帮助，但请使用合适的渠道，以便我们高效响应。
+CC Switch-KP 是一个由志愿者维护的开源项目。我们很乐意提供帮助，但请使用合适的渠道，以便我们高效响应。
 
 ### 提问之前
 

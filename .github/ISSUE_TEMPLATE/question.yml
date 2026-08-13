@@ -57,8 +57,8 @@ body:
     attributes:
       label: Environment / 环境信息
       description: |
-        OS, CC Switch version, and any relevant details.
-        操作系统、CC Switch 版本及其他相关信息。
-      placeholder: "e.g. macOS 15.4, CC Switch 3.11.1"
+        OS, CC Switch-KP version, and any relevant details.
+        操作系统、CC Switch-KP 版本及其他相关信息。
+      placeholder: "e.g. macOS 15.4, CC Switch-KP 3.11.1"
     validations:
       required: false

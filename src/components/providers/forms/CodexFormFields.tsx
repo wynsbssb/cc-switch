@@ -36,7 +36,6 @@ import {
 } from "./shared";
 import { XaiOAuthSection } from "./XaiOAuthSection";
 import {
-  fetchCodexOfficialModels,
   fetchModelsForConfig,
   fetchXaiOauthModels,
   showFetchModelsError,
@@ -199,20 +198,6 @@ type CodexCustomModelRow = Omit<
   routes: CodexCustomModelRouteRow[];
 };
 
-// Codex ???????????gpt-5.x ???????????????
-// ??????????????????????????????
-// ?????????????????????????????????
-const CODEX_OFFICIAL_MODEL_NAMES = [
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.4-mini",
-  "gpt-5.2",
-  "codex-auto-review",
-] as const;
-
-/// ??????????????????? model ???
-const CODEX_SLOT_CLEAR_VALUE = "__codex_slot_clear__";
 
 function createCustomModelRouteRow(
   seed?: Partial<CodexCustomModelRoute>,
@@ -417,27 +402,6 @@ export function CodexFormFields({
     }
   }, [hasAnyAdvancedValue, isXaiOauthPreset]);
 
-  // 官方 Codex 自定义模型的插槽下拉：优先从官方动态获取当前模型，失败（未登录/
-  // 请求异常）时回退到内置快照列表，避免绑定已下线的插槽导致模型在 Codex 里不显示。
-  const [officialModelSlugs, setOfficialModelSlugs] = useState<string[]>([]);
-  useEffect(() => {
-    if (category !== "official") {
-      return;
-    }
-    let cancelled = false;
-    fetchCodexOfficialModels()
-      .then((slugs) => {
-        if (!cancelled && slugs.length > 0) {
-          setOfficialModelSlugs(slugs);
-        }
-      })
-      .catch(() => {
-        // 保持空数组，回退到 CODEX_OFFICIAL_MODEL_NAMES
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [category]);
 
   const [catalogRows, setCatalogRows] = useState<CodexCatalogRow[]>(() =>
     catalogModels.map((m) => createCatalogRow(m)),
@@ -577,8 +541,8 @@ export function CodexFormFields({
     return map;
   }, [codexProviders, providerCatalogModels]);
 
-  // 选定供应商后：带出默认上游模型，并尽量自动填显示名/上下文窗口。
-  // 模型名称（Codex 展示用）保持用户选择不变。
+  // 选定供应商后：带出默认上游模型，并自动填 Codex 展示 ID、显示名/上下文窗口。
+  // 实际请求模型变化时也同步把展示 ID 映射成该供应商模型，用户无需再选插槽。
   const handleCustomRouteProviderChange = useCallback(
     (index: number, routeIndex: number, providerId: string) => {
       const provider = codexProviders.find((p) => p.id === providerId);
@@ -603,6 +567,7 @@ export function CodexFormFields({
           if (routeIndex !== 0) return { ...row, routes };
           return {
             ...row,
+            model: defaultUpstreamModel,
             routes,
             displayName: match?.displayName?.trim() || "",
             contextWindow: match?.contextWindow ?? "",
@@ -636,6 +601,7 @@ export function CodexFormFields({
           if (routeIndex !== 0) return { ...row, routes };
           return {
             ...row,
+            model,
             routes,
             displayName: match?.displayName?.trim() || "",
             contextWindow: match?.contextWindow ?? "",
@@ -651,11 +617,10 @@ export function CodexFormFields({
     [providerCatalogModels],
   );
 
-  // ?????Codex ??????????? ID????????
-  const handleCustomDisplayModelChange = useCallback(
-    (index: number, model: string) => {
+  const handleUpdateCustomRow = useCallback(
+    (index: number, patch: Partial<CodexCustomModelRow>) => {
       setCustomRows((current) =>
-        current.map((r, i) => (i === index ? { ...r, model } : r)),
+        current.map((r, i) => (i === index ? { ...r, ...patch } : r)),
       );
     },
     [],
@@ -1037,7 +1002,7 @@ export function CodexFormFields({
                 <div className="flex items-center justify-between gap-3">
                   <FormLabel>
                     {t("codexConfig.customModelsTitle", {
-                      defaultValue: "自定义模型（官方登录）",
+                      defaultValue: "自定义模型列表",
                     })}
                   </FormLabel>
                   <Button
@@ -1049,7 +1014,7 @@ export function CodexFormFields({
                   >
                     <Plus className="h-3.5 w-3.5" />
                     {t("codexConfig.addCustomModel", {
-                      defaultValue: "添加自定义模型",
+                      defaultValue: "添加模型",
                     })}
                   </Button>
                 </div>
@@ -1061,22 +1026,17 @@ export function CodexFormFields({
                       })
                     : t("codexConfig.customModelsHintAggregate", {
                         defaultValue:
-                          "Codex 桌面端只认官方模型名：为每个模型选一个 Codex 插槽名（如 gpt-5.2），实际请求会映射到你绑定的供应商的上游模型。",
+                          "选择供应商并填写实际请求模型，CC Switch 会自动生成 Codex 展示模型并映射到该供应商；上下文窗口留空按 128k 处理。",
                       })}
                 </p>
               </div>
 
               {customRows.length > 0 && (
                 <div className="space-y-2">
-                  <div className="hidden grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_110px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+                  <div className="hidden grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,120px)_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
                     <span>
                       {t("codexConfig.customColumnProvider", {
-                        defaultValue: "目标供应商",
-                      })}
-                    </span>
-                    <span>
-                      {t("codexConfig.customColumnModelName", {
-                        defaultValue: "Codex 插槽",
+                        defaultValue: "供应商",
                       })}
                     </span>
                     <span>
@@ -1098,305 +1058,339 @@ export function CodexFormFields({
                   </div>
 
                   {customRows.map((row, index) => {
+                    const primaryRoute = row.routes[0];
+                    const extraRoutes = row.routes.slice(1);
                     return (
                       <div
                         key={row.rowId}
                         className="space-y-2 rounded-lg border border-border-default p-3"
                       >
-                        {/* ???? + ?????? + ?? */}
-                        <div className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_36px]">
+                        <div className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,120px)_36px]">
                           <Select
-                            value={row.model}
+                            value={primaryRoute?.providerId ?? ""}
                             onValueChange={(value) =>
-                              handleCustomDisplayModelChange(
-                                index,
-                                value === CODEX_SLOT_CLEAR_VALUE ? "" : value,
-                              )
+                              handleCustomRouteProviderChange(index, 0, value)
                             }
                           >
                             <SelectTrigger
                               className="min-w-0 select-fade-value"
-                              aria-label={t(
-                                "codexConfig.customColumnModelName",
-                                {
-                                  defaultValue: "Codex ??",
-                                },
-                              )}
-                              title={t("codexConfig.customModelNameHint", {
-                                defaultValue:
-                                  "Codex ?????????????? Codex ????? gpt-5.2????????????????????????????",
+                              aria-label={t("codexConfig.customColumnProvider", {
+                                defaultValue: "供应商",
                               })}
                             >
                               <SelectValue
                                 placeholder={t(
-                                  "codexConfig.customModelNamePlaceholder",
+                                  "codexConfig.customProviderPlaceholder",
                                   {
-                                    defaultValue: "??? Codex ???? gpt-5.2?",
+                                    defaultValue: "选择供应商",
                                   },
                                 )}
                               />
                             </SelectTrigger>
                             <SelectContent>
-                              <SelectItem value={CODEX_SLOT_CLEAR_VALUE}>
-                                {t("codexConfig.customSlotClear", {
-                                  defaultValue: "????",
-                                })}
-                              </SelectItem>
-                              {(() => {
-                                const slotBase =
-                                  officialModelSlugs.length > 0
-                                    ? officialModelSlugs
-                                    : CODEX_OFFICIAL_MODEL_NAMES;
-                                const usedElsewhere = new Set(
-                                  customRows
-                                    .filter((_r, i2) => i2 !== index)
-                                    .map((r) => r.model)
-                                    .filter(Boolean),
-                                );
-                                const slotOptions: string[] = slotBase.filter(
-                                  (m) => !usedElsewhere.has(m),
-                                );
-                                if (
-                                  row.model &&
-                                  !slotOptions.includes(row.model)
-                                ) {
-                                  slotOptions.push(row.model);
-                                }
-                                return slotOptions;
-                              })().map((model) => (
-                                <SelectItem key={model} value={model}>
-                                  {model}
-                                </SelectItem>
-                              ))}
+                              {codexProviders
+                                .filter(
+                                  (provider) =>
+                                    !(
+                                      !enableOfficialLogin &&
+                                      provider.id ===
+                                        CODEX_OFFICIAL_PROVIDER_ID
+                                    ),
+                                )
+                                .map((provider) => (
+                                  <SelectItem
+                                    key={provider.id}
+                                    value={provider.id}
+                                  >
+                                    {provider.name}
+                                  </SelectItem>
+                                ))}
                             </SelectContent>
                           </Select>
-                          <div
-                            className="flex h-9 min-w-0 items-center rounded-md border border-transparent px-3 text-sm text-muted-foreground"
-                            aria-label={t("codexConfig.catalogColumnDisplay", {
-                              defaultValue: "?????",
-                            })}
-                            title={t(
-                              "codexConfig.customDisplayNameReadonlyHint",
+                          <Input
+                            value={row.displayName ?? ""}
+                            onChange={(event) =>
+                              handleUpdateCustomRow(index, {
+                                displayName: event.target.value,
+                              })
+                            }
+                            placeholder={t(
+                              "codexConfig.catalogDisplayNamePlaceholder",
                               {
-                                defaultValue: "??????????????????",
+                                defaultValue: "例如: DeepSeek V4 Flash",
                               },
                             )}
-                          >
-                            <span className="flex-1 text-fade-out">
-                              {row.displayName?.trim() || row.model || "?"}
-                            </span>
-                          </div>
-                          <div
-                            className="flex h-9 min-w-0 items-center rounded-md border border-transparent px-3 text-sm text-muted-foreground"
-                            aria-label={t("codexConfig.catalogColumnContext", {
-                              defaultValue: "?????",
+                            aria-label={t(
+                              "codexConfig.catalogColumnDisplay",
+                              {
+                                defaultValue: "菜单显示名",
+                              },
+                            )}
+                          />
+                          <ModelInputWithFetch
+                            id={`custom-primary-model-${index}`}
+                            value={primaryRoute?.upstreamModel ?? ""}
+                            onChange={(value) =>
+                              handleCustomRouteModelChange(index, 0, value)
+                            }
+                            placeholder={t(
+                              "codexConfig.catalogColumnModel",
+                              {
+                                defaultValue: "实际请求模型",
+                              },
+                            )}
+                            fetchedModels={(
+                              customCatalogByProvider[
+                                primaryRoute?.providerId ?? ""
+                              ] ?? []
+                            ).map((model) => ({
+                              id: model.model,
+                              ownedBy:
+                                codexProviders.find(
+                                  (p) =>
+                                    p.id === primaryRoute?.providerId,
+                                )?.name ?? "Catalog",
+                            }))}
+                            isLoading={false}
+                            disabled={!primaryRoute?.providerId}
+                            ariaLabel={t("codexConfig.catalogColumnModel", {
+                              defaultValue: "实际请求模型",
                             })}
-                            title={t("codexConfig.customContextReadonlyHint", {
-                              defaultValue: "????????????????????????",
-                            })}
-                          >
-                            <span className="flex-1 text-fade-out">
-                              {row.contextWindow
-                                ? `${row.contextWindow}`
-                                : t("codexConfig.catalogContextPlaceholder", {
-                                    defaultValue: "?? 128k",
-                                  })}
-                            </span>
-                          </div>
+                          />
+                          <Input
+                            type="number"
+                            min={1}
+                            inputMode="numeric"
+                            value={row.contextWindow ?? ""}
+                            onChange={(event) =>
+                              handleUpdateCustomRow(index, {
+                                contextWindow: event.target.value.replace(
+                                  /[^\d]/g,
+                                  "",
+                                ),
+                              })
+                            }
+                            placeholder={t(
+                              "codexConfig.contextWindowPlaceholder",
+                              {
+                                defaultValue: "例如: 128000",
+                              },
+                            )}
+                            aria-label={t(
+                              "codexConfig.catalogColumnContext",
+                              {
+                                defaultValue: "上下文窗口",
+                              },
+                            )}
+                          />
                           <Button
                             type="button"
                             variant="ghost"
                             size="icon"
+                            className="h-9 w-9 text-muted-foreground hover:text-destructive"
                             onClick={() => handleRemoveCustomModelRow(index)}
-                            className="h-8 w-8 text-muted-foreground hover:text-destructive"
                             aria-label={t("codexConfig.removeCustomModel", {
-                              defaultValue: "??",
+                              defaultValue: "删除",
                             })}
                           >
                             <Trash2 className="h-4 w-4" />
                           </Button>
                         </div>
 
-                        {/* ?????????????????????? */}
-                        <div className="space-y-2 pt-2">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-xs font-medium text-muted-foreground">
-                              {t("codexConfig.customRouteChainTitle", {
-                                defaultValue: "???????????",
-                              })}
-                            </span>
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              onClick={() => handleAddCustomModelRoute(index)}
-                            >
-                              <Plus className="h-4 w-4" />
-                              {t("codexConfig.addCustomRoute", {
-                                defaultValue: "????",
-                              })}
-                            </Button>
-                          </div>
-                          {row.routes.map((route, routeIndex) => (
-                            <div
-                              key={route.routeId}
-                              className="grid grid-cols-1 items-center gap-2 md:grid-cols-[44px_minmax(0,1.2fr)_minmax(0,1fr)_92px_36px_36px]"
-                            >
-                              <div
-                                className="flex h-9 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground"
-                                aria-label={t(
-                                  "codexConfig.customRoutePriority",
-                                  {
-                                    defaultValue: "???",
-                                  },
-                                )}
-                              >
-                                {routeIndex + 1}
-                              </div>
-                              <Select
-                                value={route.providerId}
-                                onValueChange={(value) =>
-                                  handleCustomRouteProviderChange(
-                                    index,
-                                    routeIndex,
-                                    value,
-                                  )
-                                }
-                              >
-                                <SelectTrigger
-                                  className="min-w-0 select-fade-value"
-                                  aria-label={t(
-                                    "codexConfig.customColumnProvider",
-                                    {
-                                      defaultValue: "?????",
-                                    },
-                                  )}
+                        {extraRoutes.length > 0 && (
+                          <div className="space-y-2 pt-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-medium text-muted-foreground">
+                                {t("codexConfig.customRouteChainTitle", {
+                                  defaultValue: "删除",
+                                })}
+                              </span>
+                            </div>
+                            {extraRoutes.map((route, extraIndex) => {
+                              const routeIndex = extraIndex + 1;
+                              return (
+                                <div
+                                  key={route.routeId}
+                                  className="grid grid-cols-1 items-center gap-2 md:grid-cols-[44px_minmax(0,1.2fr)_minmax(0,1fr)_92px_36px_36px]"
                                 >
-                                  <SelectValue
-                                    placeholder={t(
-                                      "codexConfig.customProviderPlaceholder",
+                                  <div
+                                    className="flex h-9 items-center justify-center rounded-md bg-muted text-xs font-semibold text-muted-foreground"
+                                    aria-label={t(
+                                      "codexConfig.customRoutePriority",
                                       {
-                                        defaultValue: "?????",
+                                        defaultValue: "更多路由（按优先级尝试）",
+                                      },
+                                    )}
+                                  >
+                                    {routeIndex + 1}
+                                  </div>
+                                  <Select
+                                    value={route.providerId}
+                                    onValueChange={(value) =>
+                                      handleCustomRouteProviderChange(
+                                        index,
+                                        routeIndex,
+                                        value,
+                                      )
+                                    }
+                                  >
+                                    <SelectTrigger
+                                      className="min-w-0 select-fade-value"
+                                      aria-label={t(
+                                        "codexConfig.customColumnProvider",
+                                        {
+                                          defaultValue: "优先级",
+                                        },
+                                      )}
+                                    >
+                                      <SelectValue
+                                        placeholder={t(
+                                          "codexConfig.customProviderPlaceholder",
+                                          {
+                                            defaultValue: "供应商",
+                                          },
+                                        )}
+                                      />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      {codexProviders
+                                        .filter(
+                                          (provider) =>
+                                            !(
+                                              !enableOfficialLogin &&
+                                              provider.id ===
+                                                CODEX_OFFICIAL_PROVIDER_ID
+                                            ),
+                                        )
+                                        .map((provider) => (
+                                          <SelectItem
+                                            key={provider.id}
+                                            value={provider.id}
+                                          >
+                                            {provider.name}
+                                          </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                  </Select>
+                                  <ModelInputWithFetch
+                                    id={`custom-upstream-${index}-${routeIndex}`}
+                                    value={route.upstreamModel ?? ""}
+                                    onChange={(value) =>
+                                      handleCustomRouteModelChange(
+                                        index,
+                                        routeIndex,
+                                        value,
+                                      )
+                                    }
+                                    placeholder={t(
+                                      "codexConfig.catalogColumnModel",
+                                      {
+                                        defaultValue: "实际请求模型",
+                                      },
+                                    )}
+                                    fetchedModels={(
+                                      customCatalogByProvider[
+                                        route.providerId
+                                      ] ?? []
+                                    ).map((model) => ({
+                                      id: model.model,
+                                      ownedBy:
+                                        codexProviders.find(
+                                          (p) =>
+                                            p.id === route.providerId,
+                                        )?.name ?? "Catalog",
+                                    }))}
+                                    isLoading={false}
+                                    disabled={!route.providerId}
+                                    ariaLabel={t(
+                                      "codexConfig.catalogColumnModel",
+                                      {
+                                        defaultValue: "实际请求模型",
                                       },
                                     )}
                                   />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  {codexProviders
-                                    .filter(
-                                      (provider) =>
-                                        !(
-                                          !enableOfficialLogin &&
-                                          provider.id ===
-                                            CODEX_OFFICIAL_PROVIDER_ID
-                                        ),
-                                    )
-                                    .map((provider) => (
-                                      <SelectItem
-                                        key={provider.id}
-                                        value={provider.id}
-                                      >
-                                        {provider.name}
-                                      </SelectItem>
-                                    ))}
-                                </SelectContent>
-                              </Select>
-                              <ModelInputWithFetch
-                                id={`custom-upstream-${index}-${routeIndex}`}
-                                value={route.upstreamModel ?? row.model}
-                                onChange={(value) =>
-                                  handleCustomRouteModelChange(
-                                    index,
-                                    routeIndex,
-                                    value,
-                                  )
-                                }
-                                placeholder={t(
-                                  "codexConfig.catalogColumnModel",
-                                  {
-                                    defaultValue: "??????",
-                                  },
-                                )}
-                                ariaLabel={t("codexConfig.catalogColumnModel", {
-                                  defaultValue: "??????",
-                                })}
-                                fetchedModels={(
-                                  customCatalogByProvider[route.providerId] ??
-                                  []
-                                ).map((model) => ({
-                                  id: model.model,
-                                  ownedBy:
-                                    codexProviders.find(
-                                      (p) => p.id === route.providerId,
-                                    )?.name ?? "Catalog",
-                                }))}
-                                isLoading={false}
-                                disabled={!route.providerId}
-                              />
-                              <div className="flex items-center gap-1">
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                                  disabled={routeIndex === 0}
-                                  onClick={() =>
-                                    handleMoveCustomModelRoute(
-                                      index,
-                                      routeIndex,
-                                      -1,
-                                    )
-                                  }
-                                  aria-label={t(
-                                    "codexConfig.moveCustomRouteUp",
-                                    { defaultValue: "??" },
-                                  )}
-                                >
-                                  <ArrowUp className="h-4 w-4" />
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                                  disabled={
-                                    routeIndex === row.routes.length - 1
-                                  }
-                                  onClick={() =>
-                                    handleMoveCustomModelRoute(
-                                      index,
-                                      routeIndex,
-                                      1,
-                                    )
-                                  }
-                                  aria-label={t(
-                                    "codexConfig.moveCustomRouteDown",
-                                    { defaultValue: "??" },
-                                  )}
-                                >
-                                  <ArrowDown className="h-4 w-4" />
-                                </Button>
-                              </div>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon"
-                                className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                                disabled={row.routes.length <= 1}
-                                onClick={() =>
-                                  handleRemoveCustomModelRoute(
-                                    index,
-                                    routeIndex,
-                                  )
-                                }
-                                aria-label={t("codexConfig.removeCustomRoute", {
-                                  defaultValue: "????",
-                                })}
-                              >
-                                <Trash2 className="h-4 w-4" />
-                              </Button>
-                            </div>
-                          ))}
+                                  <div className="flex items-center gap-1">
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon"
+                                      className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                      disabled={routeIndex === 1}
+                                      onClick={() =>
+                                        handleMoveCustomModelRoute(
+                                          index,
+                                          routeIndex,
+                                          -1,
+                                        )
+                                      }
+                                      aria-label={t(
+                                        "codexConfig.moveCustomRouteUp",
+                                        { defaultValue: "上移" },
+                                      )}
+                                    >
+                                      <ArrowUp className="h-4 w-4" />
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon"
+                                      className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                      disabled={
+                                        routeIndex === row.routes.length - 1
+                                      }
+                                      onClick={() =>
+                                        handleMoveCustomModelRoute(
+                                          index,
+                                          routeIndex,
+                                          1,
+                                        )
+                                      }
+                                      aria-label={t(
+                                        "codexConfig.moveCustomRouteDown",
+                                        { defaultValue: "下移" },
+                                      )}
+                                    >
+                                      <ArrowDown className="h-4 w-4" />
+                                    </Button>
+                                  </div>
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                                    disabled={row.routes.length <= 1}
+                                    onClick={() =>
+                                      handleRemoveCustomModelRoute(
+                                        index,
+                                        routeIndex,
+                                      )
+                                    }
+                                    aria-label={t(
+                                      "codexConfig.removeCustomRoute",
+                                      { defaultValue: "移除路由" },
+                                    )}
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </Button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        <div className="pt-1">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleAddCustomModelRoute(index)}
+                            className="h-7 gap-1"
+                          >
+                            <Plus className="h-4 w-4" />
+                            {t("codexConfig.addCustomRoute", {
+                              defaultValue: "添加路由",
+                            })}
+                          </Button>
                         </div>
                       </div>
                     );
@@ -1730,7 +1724,7 @@ export function CodexFormFields({
                   <p className="text-xs leading-relaxed text-muted-foreground">
                     {t("codexConfig.modelMappingHint", {
                       defaultValue:
-                        "选择模型角色后，CC Switch 会自动生成 Codex 兼容路由；菜单显示名可以填 DeepSeek、Kimi 等品牌模型，实际请求模型按右侧填写内容发送。",
+                        "选择模型角色后，CC Switch-KP 会自动生成 Codex 兼容路由；菜单显示名可以填 DeepSeek、Kimi 等品牌模型，实际请求模型按右侧填写内容发送。",
                     })}
                   </p>
                 </div>
@@ -1742,11 +1736,6 @@ export function CodexFormFields({
                       <span>
                         {t("codexConfig.catalogColumnDisplay", {
                           defaultValue: "菜单显示名",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnModel", {
-                          defaultValue: "实际请求模型",
                         })}
                       </span>
                       <span>

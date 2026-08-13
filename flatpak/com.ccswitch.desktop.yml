@@ -4,7 +4,7 @@ runtime: org.gnome.Platform
 runtime-version: '46'
 sdk: org.gnome.Sdk
 
-command: cc-switch
+command: cc-switch-kp
 
 finish-args:
   - --share=ipc
@@ -80,7 +80,7 @@ modules:
     sources:
       # Placed in flatpak/ directory by CI or local build script
       - type: file
-        path: cc-switch.deb
+        path: cc-switch-kp.deb
       - type: file
         path: com.ccswitch.desktop.desktop
       - type: file

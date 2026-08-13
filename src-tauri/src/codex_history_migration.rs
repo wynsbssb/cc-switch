@@ -1383,7 +1383,7 @@ base_url = "https://aihubmix.example/v1"
             ),
             Provider::with_id(
                 "legacy-ccswitch".to_string(),
-                "Legacy CC Switch".to_string(),
+                "Legacy CC Switch-KP".to_string(),
                 serde_json::json!({
                     "auth": {},
                     "config": r#"model_provider = "ccswitch"
@@ -1576,15 +1576,15 @@ base_url = "https://proxy.example/v1"
             .and_then(|value| value.get("aihubmix"))
             .is_none());
 
-        let ccswitch_config: toml::Value =
+        let ccswitch_kp_config: toml::Value =
             toml::from_str(&config_provider_id("legacy-ccswitch")).expect("parse ccswitch config");
         assert_eq!(
-            ccswitch_config
+            ccswitch_kp_config
                 .get("model_provider")
                 .and_then(|value| value.as_str()),
             Some("custom")
         );
-        assert!(ccswitch_config
+        assert!(ccswitch_kp_config
             .get("model_providers")
             .and_then(|value| value.get("ccswitch"))
             .is_none());
@@ -2272,7 +2272,7 @@ model_provider = "my-private-relay"
     }
 
     #[test]
-    fn collects_legacy_ccswitch_provider_id_from_stored_config() {
+    fn collects_legacy_ccswitch_kp_provider_id_from_stored_config() {
         let db = Database::memory().expect("memory db");
         let mut provider = Provider::with_id(
             "generated-uuid".to_string(),
@@ -2374,11 +2374,11 @@ model = "gpt-5.4"
     }
 
     #[test]
-    fn migrates_legacy_ccswitch_provider_template_to_custom() {
+    fn migrates_legacy_ccswitch_kp_provider_template_to_custom() {
         let db = Database::memory().expect("memory db");
         let provider = Provider::with_id(
             "legacy-ccswitch".to_string(),
-            "Legacy CC Switch".to_string(),
+            "Legacy CC Switch-KP".to_string(),
             serde_json::json!({
                 "auth": {},
                 "config": r#"model_provider = "ccswitch"
