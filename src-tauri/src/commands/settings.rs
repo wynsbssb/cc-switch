@@ -170,6 +170,85 @@ pub async fn restore_codex_unified_history() -> Result<CodexUnifyHistoryRestoreR
     })
 }
 
+/// 是否存在当前 Codex 目录的桌面端对话快照（决定前端是否显示"从备份恢复"）。
+#[tauri::command]
+pub async fn has_codex_desktop_conversations_backup() -> Result<bool, String> {
+    Ok(crate::codex_desktop_conversations::has_codex_desktop_conversations_backup())
+}
+
+/// 手动快照一次 Codex 桌面端对话数据（开关关闭时返回 skippedReason）。
+#[tauri::command]
+pub async fn snapshot_codex_desktop_conversations(
+) -> Result<crate::codex_desktop_conversations::CodexDesktopConversationsSnapshotOutcome, String> {
+    let outcome = tauri::async_runtime::spawn_blocking(|| {
+        crate::codex_desktop_conversations::snapshot_codex_desktop_conversations()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if let Some(reason) = &outcome.skipped_reason {
+        log::debug!("Codex desktop conversation snapshot skipped: {reason}");
+    } else {
+        log::info!(
+            "Manual Codex desktop conversation snapshot: jsonl={}, archived={}, state_dbs={}",
+            outcome.jsonl_files,
+            outcome.archived_files,
+            outcome.state_dbs
+        );
+    }
+    Ok(outcome)
+}
+
+/// 从当前 Codex 目录对应的最新快照恢复桌面端对话数据（恢复前先归档现状）。
+#[tauri::command]
+pub async fn restore_codex_desktop_conversations(
+) -> Result<crate::codex_desktop_conversations::CodexDesktopConversationsRestoreOutcome, String> {
+    let outcome = tauri::async_runtime::spawn_blocking(|| {
+        crate::codex_desktop_conversations::restore_codex_desktop_conversations()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if let Some(reason) = &outcome.skipped_reason {
+        log::debug!("Codex desktop conversation restore skipped: {reason}");
+    } else {
+        log::info!(
+            "Codex desktop conversation restored: jsonl={}, archived={}, state_dbs={}",
+            outcome.jsonl_files,
+            outcome.archived_files,
+            outcome.state_dbs
+        );
+    }
+    Ok(outcome)
+}
+
+/// 启用 Codex 会话/状态数据统一存放（迁移 + 建目录链接 + 注入 sqlite_home）。
+#[tauri::command]
+pub async fn enable_codex_unified_storage(
+) -> Result<crate::codex_unified_storage::CodexUnifiedStorageOutcome, String> {
+    tauri::async_runtime::spawn_blocking(crate::codex_unified_storage::enable)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// 关闭 Codex 会话/状态数据统一存放（数据移回 ~/.codex + 撤链接）。
+#[tauri::command]
+pub async fn disable_codex_unified_storage(
+) -> Result<crate::codex_unified_storage::CodexUnifiedStorageOutcome, String> {
+    tauri::async_runtime::spawn_blocking(crate::codex_unified_storage::disable)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// 查询 Codex 统一存储状态（开关、链接、各路径）。
+#[tauri::command]
+pub fn get_codex_unified_storage_status(
+) -> crate::codex_unified_storage::CodexUnifiedStorageOutcome {
+    crate::codex_unified_storage::status()
+}
+
 /// 重启应用程序（当 app_config_dir 变更后使用）
 #[tauri::command]
 pub async fn restart_app(app: AppHandle) -> Result<bool, String> {

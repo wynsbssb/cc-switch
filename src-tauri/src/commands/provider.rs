@@ -88,6 +88,20 @@ fn switch_provider_internal(
     app_type: AppType,
     id: &str,
 ) -> Result<SwitchResult, AppError> {
+    // 切换 Codex 供应商前先快照桌面端对话数据（~/.codex sessions / state DB）。
+    // 切换会改写 ~/.codex 的 config/auth，先留一份快照，保证用户之后即使
+    // 关闭 cc-switch、直接在桌面端用 ChatGPT 账号登录，对话数据也不丢、可恢复。
+    if app_type == AppType::Codex {
+        // 后台执行 + 数据未变化时跳过：避免每次切换 Codex 路由都同步复制
+        // 数百 MB 的会话文件而拖慢切换。
+        std::thread::spawn(|| {
+            if let Err(e) = crate::codex_desktop_conversations::
+                snapshot_codex_desktop_conversations_if_changed()
+            {
+                log::warn!("Codex desktop conversation snapshot before switch failed: {e}");
+            }
+        });
+    }
     ProviderService::switch(state, app_type, id)
 }
 

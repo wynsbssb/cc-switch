@@ -3210,7 +3210,12 @@ impl ProxyService {
                 )
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
             let live_config = if official_passthrough {
-                prepared_config
+                if crate::settings::unify_codex_session_history() {
+                    crate::codex_config::inject_codex_unified_session_bucket(&prepared_config)
+                        .map_err(|e| format!("?? Codex ????: {e}"))?
+                } else {
+                    prepared_config
+                }
             } else {
                 crate::codex_config::prepare_codex_provider_live_config(
                     config.get("auth").unwrap_or(&Value::Null),
@@ -3231,7 +3236,7 @@ impl ProxyService {
     }
 
     fn write_codex_live_verbatim(&self, config: &Value) -> Result<(), String> {
-        use crate::codex_config::{get_codex_auth_path, get_codex_config_path};
+        use crate::codex_config::get_codex_auth_path;
 
         let auth = config.get("auth");
         let config_str = config.get("config").and_then(|v| v.as_str());
@@ -3280,8 +3285,7 @@ impl ProxyService {
                     // Codex login. This is especially important when takeover
                     // switches from an API-key-backed official session to the
                     // built-in empty `codex-official` seed.
-                    let config_path = get_codex_config_path();
-                    crate::config::write_text_file(&config_path, cfg)
+                    crate::codex_config::write_codex_config_text_preserving_plugins(cfg)
                         .map_err(|e| format!("写入 Codex config 失败: {e}"))?;
                 } else {
                     crate::codex_config::write_codex_live_atomic(auth, Some(cfg))
@@ -3294,8 +3298,7 @@ impl ProxyService {
                     .map_err(|e| format!("写入 Codex auth 失败: {e}"))?;
             }
             (None, Some(cfg)) => {
-                let config_path = get_codex_config_path();
-                crate::config::write_text_file(&config_path, cfg)
+                crate::codex_config::write_codex_config_text_preserving_plugins(cfg)
                     .map_err(|e| format!("写入 Codex config 失败: {e}"))?;
             }
             (None, None) => {}

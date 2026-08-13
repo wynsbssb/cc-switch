@@ -8,7 +8,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useProviderStats } from "@/lib/query/usage";
-import { fmtUsd } from "./format";
+import { fmtCny } from "./format";
 import type { UsageRangeSelection } from "@/types/usage";
 
 interface ProviderStatsTableProps {
@@ -85,7 +85,7 @@ export function ProviderStatsTable({
                   {stat.totalTokens.toLocaleString()}
                 </TableCell>
                 <TableCell className="text-right">
-                  {fmtUsd(stat.totalCost, 4)}
+                  {fmtCny(stat.totalCost, 4)}
                 </TableCell>
                 <TableCell className="text-right">
                   {stat.successRate.toFixed(1)}%

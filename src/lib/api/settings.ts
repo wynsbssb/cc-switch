@@ -19,6 +19,36 @@ export interface WebDavTestResult {
   message?: string;
 }
 
+export interface CodexDesktopConversationsSnapshotResult {
+  snapshotDir?: string;
+  jsonlFiles: number;
+  archivedFiles: number;
+  stateDbs: number;
+  /** 跳过原因（如开关关闭 / 无会话数据 / 无备份）；存在时不应报成功 */
+  skippedReason?: string;
+}
+
+export interface CodexDesktopConversationsRestoreResult {
+  snapshotDir?: string;
+  jsonlFiles: number;
+  archivedFiles: number;
+  stateDbs: number;
+  skippedReason?: string;
+}
+
+export interface CodexUnifiedStorageResult {
+  enabled: boolean;
+  active: boolean;
+  codexDir: string;
+  sessionsDir: string;
+  archivedDir: string;
+  stateDir: string;
+  migratedSessions: number;
+  migratedArchived: number;
+  migratedStateDbs: number;
+  skippedReason?: string;
+}
+
 export interface CodexUnifyHistoryRestoreResult {
   restoredJsonlFiles: number;
   restoredStateRows: number;
@@ -47,6 +77,36 @@ export const settingsApi = {
   /** 按迁移备份账本把当时迁入共享桶的官方会话还原回 openai 桶（幂等） */
   async restoreCodexUnifiedHistory(): Promise<CodexUnifyHistoryRestoreResult> {
     return await invoke("restore_codex_unified_history");
+  },
+
+  /** 是否存在当前 Codex 目录的桌面端对话快照 */
+  async hasCodexDesktopConversationsBackup(): Promise<boolean> {
+    return await invoke("has_codex_desktop_conversations_backup");
+  },
+
+  /** 手动快照一次 Codex 桌面端对话数据 */
+  async snapshotCodexDesktopConversations(): Promise<CodexDesktopConversationsSnapshotResult> {
+    return await invoke("snapshot_codex_desktop_conversations");
+  },
+
+  /** 从最新快照恢复 Codex 桌面端对话数据 */
+  async restoreCodexDesktopConversations(): Promise<CodexDesktopConversationsRestoreResult> {
+    return await invoke("restore_codex_desktop_conversations");
+  },
+
+  /** 启用 Codex 会话/状态数据统一存放（迁移 + 建目录链接 + 注入 sqlite_home） */
+  async enableCodexUnifiedStorage(): Promise<CodexUnifiedStorageResult> {
+    return await invoke("enable_codex_unified_storage");
+  },
+
+  /** 关闭 Codex 会话/状态数据统一存放（数据移回 ~/.codex + 撤链接） */
+  async disableCodexUnifiedStorage(): Promise<CodexUnifiedStorageResult> {
+    return await invoke("disable_codex_unified_storage");
+  },
+
+  /** 查询 Codex 统一存储状态 */
+  async getCodexUnifiedStorageStatus(): Promise<CodexUnifiedStorageResult> {
+    return await invoke("get_codex_unified_storage_status");
   },
 
   async restart(): Promise<boolean> {

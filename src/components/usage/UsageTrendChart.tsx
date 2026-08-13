@@ -13,7 +13,7 @@ import { useUsageTrends } from "@/lib/query/usage";
 import { Loader2 } from "lucide-react";
 import {
   fmtInt,
-  fmtUsd,
+  fmtCny,
   getLocaleFromLanguage,
   parseFiniteNumber,
 } from "./format";
@@ -105,7 +105,7 @@ export function UsageTrendChart({
               <span className="font-medium">{entry.name}:</span>
               <span>
                 {entry.dataKey === "cost"
-                  ? fmtUsd(entry.value, 6)
+                  ? fmtCny(entry.value, 6)
                   : fmtInt(entry.value, dateLocale)}
               </span>
             </div>

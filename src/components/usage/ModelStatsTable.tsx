@@ -8,7 +8,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useModelStats } from "@/lib/query/usage";
-import { fmtUsd } from "./format";
+import { fmtCny } from "./format";
 import type { UsageRangeSelection } from "@/types/usage";
 
 interface ModelStatsTableProps {
@@ -82,10 +82,10 @@ export function ModelStatsTable({
                   {stat.totalTokens.toLocaleString()}
                 </TableCell>
                 <TableCell className="text-right">
-                  {fmtUsd(stat.totalCost, 4)}
+                  {fmtCny(stat.totalCost, 4)}
                 </TableCell>
                 <TableCell className="text-right">
-                  {fmtUsd(stat.avgCostPerRequest, 6)}
+                  {fmtCny(stat.avgCostPerRequest, 6)}
                 </TableCell>
               </TableRow>
             ))

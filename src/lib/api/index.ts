@@ -1,4 +1,9 @@
 export type { AppId } from "./types";
+export type {
+  CodexDesktopConversationsSnapshotResult,
+  CodexDesktopConversationsRestoreResult,
+  CodexUnifiedStorageResult,
+} from "./settings";
 export { providersApi, universalProvidersApi } from "./providers";
 export { settingsApi } from "./settings";
 export { backupsApi } from "./settings";

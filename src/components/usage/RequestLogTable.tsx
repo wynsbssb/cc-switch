@@ -28,7 +28,7 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { UsageDateRangePicker } from "./UsageDateRangePicker";
 import {
   fmtInt,
-  fmtUsd,
+  fmtCny,
   getLocaleFromLanguage,
   parseFiniteNumber,
 } from "./format";
@@ -278,7 +278,7 @@ export function RequestLogTable({
                           >
                             {unpriced
                               ? t("usage.unpriced", "未定价")
-                              : fmtUsd(log.totalCostUsd, 4)}
+                              : fmtCny(log.totalCostUsd, 4)}
                           </div>
                           {parseFiniteNumber(log.costMultiplier) != null &&
                             parseFiniteNumber(log.costMultiplier) !== 1 && (

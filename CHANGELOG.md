@@ -5,6 +5,16 @@ All notable changes to CC Switch-KP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Codex 桌面端对话数据自动备份与恢复（不丢会话数据）**: cc-switch 运行期间（启动、切换 Codex 供应商、退出、手动触发）自动把桌面端本地会话数据——`~/.codex` 下的 `sessions/**` 会话文件、`session_index.jsonl` 列表索引、`archived_sessions/**` 归档与 `state_5.sqlite` 状态库——一致性快照到 `~/.cc-switch/backups/codex-desktop-conversations/<时间戳>/`（保留最近 10 份，超出自动清理）。即使之后关闭 cc-switch、直接在 ChatGPT 桌面端用 ChatGPT 账号登录导致本地会话被清空或隐藏，也能在「设置 → 通用 → Codex 应用增强」里一键恢复（恢复前先把当前数据移到 `pre-restore-*` 目录，操作可回退）。新增「自动备份桌面端对话数据」开关（默认开启）、「立即备份」与「从备份恢复」按钮；state DB 走 SQLite backup API，桌面端占用时也能读到一致快照。
+
+### Fixed
+
+- **ChatGPT/Codex Plugins No Longer Vanish When cc-switch Rewrites config.toml**: Provider switches, startup sync, and live-config sync rebuild `~/.codex/config.toml` from cc-switch's own database, which previously dropped the `[plugins]` and `[marketplaces]` tables the ChatGPT/Codex app uses to keep user-installed plugins registered — so plugins disappeared after the app restarted. Every Codex `config.toml` write now carries those tables over from the existing file ("auto-sync"), so plugin state survives provider switches and restarts. The takeover-restore write path gets the same preservation, and a provider's own saved `[plugins]`/`[marketplaces]` tables stay authoritative.
+
 ## [3.19.2] - 2026-08-06
 
 Development since v3.19.1 is a correctness and hardening pass, with the management UI picking up its two most-requested conveniences. The headline fix is to Codex usage accounting: a rollout file that interleaves several cumulative token counters — a gateway replaying the same snapshot under different rate-limit buckets, or two genuinely distinct counters alternating — could record several times its true usage, and the importer now recognizes both shapes; replaying a real corpus of ~1,900 rollout files lands within 0.001% of an independently computed ideal recount (#3011). A six-part security hardening caps every unbounded read a contributor's audit surfaced — usage scripts, Grok session logs, catalog files, proxy response bodies and their decompression — and the deep-link import dialog now shows two credential fields it previously persisted without rendering. OMO setups regain a working integration on two fronts: when OMO's unified config (`~/.omo/omo.jsonc` or `omo.json`) exists, writes land inside it instead of the legacy file the runtime no longer reads, and the model pickers merge in whatever the installed OpenCode reports at runtime. The MCP, prompt and skill panels gain search, with bulk per-app toggles joining the MCP and skill lists; the Auth Center shows each ChatGPT account's subscription usage inline; and two write-path overhauls — batched SQL backups and batched Codex session imports — cut the worst restore, sync and reimport stalls on large databases.

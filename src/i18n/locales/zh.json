@@ -310,6 +310,21 @@
       "restoreBackup": "把开启时迁入的官方会话还原回官方历史（按备份精确还原）",
       "confirm": "关闭"
     },
+    "unifyCodexStorage": {
+      "title": "启用会话数据统一存放",
+      "message": "把 Codex 会话与状态数据统一迁移到 ~/.cc-switch/codex（会话目录通过系统目录链接透明指向该位置，状态库由 config 注入 sqlite_home）。之后切换供应商/路由只改 config 与 auth，不再逐次复制会话数据，切换会更快。\n\n迁移会把现有 ~/.codex 下的 sessions、archived_sessions 与 state_5.sqlite 移动到统一目录。建议先退出 ChatGPT/Codex 桌面端。",
+      "confirm": "迁移并启用"
+    },
+    "unifyCodexStorageOff": {
+      "title": "关闭会话数据统一存放",
+      "message": "关闭后，统一目录里的会话与状态数据会移回 ~/.codex，并移除目录链接。若 ChatGPT/Codex 桌面端正在运行，文件被占用时移动可能失败，建议先退出桌面端。",
+      "confirm": "移回并关闭"
+    },
+    "restoreCodexDesktopConversations": {
+      "title": "恢复桌面端对话数据",
+      "message": "将用最近一次自动备份覆盖当前桌面端本地会话（会话文件、会话索引与状态库）。恢复前会把当前数据先备份到 ~/.cc-switch/backups 下的 pre-restore 目录，操作可回退。\n\n建议先退出 ChatGPT 桌面端，避免状态库被占用导致恢复失败。",
+      "confirm": "恢复"
+    },
     "usage": {
       "title": "配置用量查询",
       "message": "用量查询需要配置专用的查询脚本或 API 参数，请确保您已从供应商处获取相关信息。\n\n如不确定如何配置，请先查阅供应商文档。",
@@ -700,6 +715,22 @@
     "unifyCodexHistoryRestoreFailed": "还原官方会话历史失败，请重试",
     "unifyCodexHistoryRestoreNothing": "当前 Codex 目录没有可恢复的迁移备份",
     "unifyCodexHistoryRestoreSkippedToggleOn": "统一会话历史开关已重新开启，已跳过还原",
+    "backupCodexDesktopConversations": "自动备份桌面端对话数据",
+    "backupCodexDesktopConversationsDescription": "cc-switch 运行期间（启动、切换 Codex 供应商、退出、手动触发）自动把桌面端本地会话（~/.codex 下的 sessions、会话索引与状态库）快照到 ~/.cc-switch/backups/codex-desktop-conversations/。即使之后关闭 cc-switch、直接在桌面端用 ChatGPT 账号登录导致本地会话被清空或隐藏，也能一键恢复、不丢对话数据。",
+    "backupCodexDesktopConversationsNow": "立即备份",
+    "backupCodexDesktopConversationsCompleted": "已备份桌面端对话数据（{{files}} 个会话文件、{{dbs}} 个状态库）",
+    "backupCodexDesktopConversationsFailed": "备份桌面端对话数据失败，请重试",
+    "backupCodexDesktopConversationsSkipped": "本次没有可备份的桌面端对话数据（开关已关闭或没有会话）",
+    "restoreCodexDesktopConversations": "从备份恢复",
+    "restoreCodexDesktopConversationsCompleted": "已从备份恢复桌面端对话数据（{{files}} 个会话文件、{{dbs}} 个状态库）",
+    "restoreCodexDesktopConversationsFailed": "恢复桌面端对话数据失败，请重试",
+    "restoreCodexDesktopConversationsNothing": "当前 Codex 目录没有可恢复的对话数据备份",
+    "unifyCodexStorage": "会话数据统一存放",
+    "unifyCodexStorageDescription": "把 Codex 会话与状态数据统一放到 ~/.cc-switch/codex（目录链接 + sqlite_home）。之后切换路由只改配置、不复制会话，切换更快且会话数据永不被路由切换触碰。",
+    "unifyCodexStorageEnabled": "已启用会话数据统一存放，路由切换不再复制会话",
+    "unifyCodexStorageEnableFailed": "启用会话数据统一存放失败，请重试",
+    "unifyCodexStorageDisabled": "已关闭会话数据统一存放，数据已移回 ~/.codex",
+    "unifyCodexStorageDisableFailed": "关闭会话数据统一存放失败，请先退出 ChatGPT/Codex 桌面端后重试",
     "appVisibility": {
       "title": "主页面显示",
       "description": "选择在主页面显示的应用",
@@ -793,7 +824,7 @@
     "checking": "检查中...",
     "upToDate": "已是最新",
     "aboutHint": "查看版本信息与更新状态。",
-    "authorCredit": "???tycykp",
+    "authorCredit": "by tycykp",
     "portableMode": "当前为便携版，更新需手动下载。",
     "updateAvailable": "检测到新版本：{{version}}",
     "updateBadge": "有更新可用",

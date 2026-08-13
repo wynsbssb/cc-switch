@@ -17,7 +17,7 @@ import {
   Zap,
 } from "lucide-react";
 import {
-  fmtUsd,
+  fmtCny,
   formatTokensShort,
   getResolvedLang,
   parseFiniteNumber,
@@ -301,7 +301,7 @@ export function UsageHero({
                     {t("usage.totalCost")}
                   </span>
                   <span className="font-semibold text-green-500 text-sm tabular-nums">
-                    {totalCost == null ? "--" : fmtUsd(totalCost, 4)}
+                    {totalCost == null ? "--" : fmtCny(totalCost, 4)}
                   </span>
                 </div>
               </div>

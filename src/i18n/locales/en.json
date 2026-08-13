@@ -310,6 +310,21 @@
       "restoreBackup": "Restore the official sessions migrated at enable time back to the official history (exact restore from backup)",
       "confirm": "Turn off"
     },
+    "unifyCodexStorage": {
+      "title": "Enable unified session storage",
+      "message": "Move Codex session and state data under ~/.cc-switch/codex (the sessions folder is transparently linked from ~/.codex, and the state DB is redirected via sqlite_home in config). Provider/route switches will then only rewrite config and auth, never copying session data, so switching becomes fast.\n\nThe existing ~/.codex sessions, archived_sessions and state_5.sqlite will be moved into the unified directory. Quit the ChatGPT/Codex desktop app first if possible.",
+      "confirm": "Migrate & enable"
+    },
+    "unifyCodexStorageOff": {
+      "title": "Turn off unified session storage",
+      "message": "After turning this off, the session and state data will be moved back to ~/.codex and the directory links removed. If the ChatGPT/Codex desktop app is running, moving locked files may fail; quit the desktop app first.",
+      "confirm": "Move back & turn off"
+    },
+    "restoreCodexDesktopConversations": {
+      "title": "Restore desktop conversation data",
+      "message": "This overwrites the current local desktop conversations (session files, session index and state DB) with the latest automatic backup. Your current data is first moved to a pre-restore folder under ~/.cc-switch/backups, so the operation is reversible.\n\nIt is recommended to quit the ChatGPT desktop app first so the state DB is not locked.",
+      "confirm": "Restore"
+    },
     "usage": {
       "title": "Configure Usage Query",
       "message": "Usage query requires a custom script or API parameters. Please make sure you have obtained the necessary information from your provider.\n\nIf unsure how to configure, please consult your provider's documentation first.",
@@ -700,6 +715,22 @@
     "unifyCodexHistoryRestoreFailed": "Failed to restore official session history, please try again",
     "unifyCodexHistoryRestoreNothing": "No restorable migration backup for the current Codex directory",
     "unifyCodexHistoryRestoreSkippedToggleOn": "Unified session history was re-enabled; restore skipped",
+    "backupCodexDesktopConversations": "Back up desktop conversation data",
+    "backupCodexDesktopConversationsDescription": "While cc-switch is running (on startup, Codex provider switch, exit, and manually), snapshot the desktop's local conversations (~/.codex sessions, session index and state DB) to ~/.cc-switch/backups/codex-desktop-conversations/. Even after cc-switch is closed and you log in with your ChatGPT account in the desktop app, your conversations can be restored in one click and are never truly lost.",
+    "backupCodexDesktopConversationsNow": "Back up now",
+    "backupCodexDesktopConversationsCompleted": "Desktop conversations backed up ({{files}} session files, {{dbs}} state DBs)",
+    "backupCodexDesktopConversationsFailed": "Failed to back up desktop conversations, please try again",
+    "backupCodexDesktopConversationsSkipped": "No desktop conversation data to back up (toggle is off or no sessions found)",
+    "restoreCodexDesktopConversations": "Restore from backup",
+    "restoreCodexDesktopConversationsCompleted": "Desktop conversations restored from backup ({{files}} session files, {{dbs}} state DBs)",
+    "restoreCodexDesktopConversationsFailed": "Failed to restore desktop conversations, please try again",
+    "restoreCodexDesktopConversationsNothing": "No conversation backup for the current Codex directory",
+    "unifyCodexStorage": "Unified session storage",
+    "unifyCodexStorageDescription": "Keep Codex session and state data in one place under ~/.cc-switch/codex (directory links + sqlite_home). Route switches only rewrite config, never copy sessions, so switching is fast and session data is never touched.",
+    "unifyCodexStorageEnabled": "Unified session storage enabled; route switches no longer copy session data",
+    "unifyCodexStorageEnableFailed": "Failed to enable unified session storage",
+    "unifyCodexStorageDisabled": "Unified session storage disabled; data moved back to ~/.codex",
+    "unifyCodexStorageDisableFailed": "Failed to disable unified session storage; quit the ChatGPT/Codex desktop app and retry",
     "appVisibility": {
       "title": "Homepage Display",
       "description": "Choose which apps to show on the homepage",
@@ -793,7 +824,7 @@
     "checking": "Checking...",
     "upToDate": "Up to Date",
     "aboutHint": "View version information and update status.",
-    "authorCredit": "Credit: tycykp",
+    "authorCredit": "by tycykp",
     "portableMode": "Portable mode: updates require manual download.",
     "updateAvailable": "New version available: {{version}}",
     "updateBadge": "Update available",

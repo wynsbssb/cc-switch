@@ -20,11 +20,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
 #[cfg(not(test))]
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Mutex;
+use std::time::Duration;
 
+#[cfg(not(test))]
 use once_cell::sync::OnceCell;
 use serde_json::{json, Value};
 use toml_edit::DocumentMut;
@@ -47,6 +48,7 @@ const CODEX_DESKTOP_STATSIG_LAST_MODIFIED_KEY_MARKER: &str =
     "statsig.last_modified_time.evaluations";
 const CODEX_DESKTOP_STATSIG_PIN_HORIZON_MILLIS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const CODEX_DESKTOP_CACHE_RETRY_INITIAL_DELAY_SECS: u64 = 1;
+#[cfg(not(test))]
 const CODEX_DESKTOP_CACHE_RETRY_MAX_DELAY_SECS: u64 = 30;
 const CODEX_DESKTOP_CACHE_RENEWAL_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 static CODEX_DESKTOP_CACHE_SYNC_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +63,7 @@ enum CodexDesktopStatsigWrapperEncoding {
     Utf16Le,
 }
 
+#[cfg(not(test))]
 #[derive(Debug, PartialEq, Eq)]
 enum CodexDesktopCacheRetryOutcome {
     Synced(usize),
@@ -88,29 +91,42 @@ struct CodexDesktopCacheSyncResult {
     needs_discovery: bool,
 }
 
-/// Model ids from the provider's inline `modelCatalog` mapping (DB SSOT).
+/// Public model ids cc-switch wants the Desktop picker to show: the inline
+/// `modelCatalog` mapping (DB SSOT for third-party providers) plus, for the
+/// official aggregate provider, the public slots declared in
+/// `codexCustomModels`.
 fn codex_model_ids_from_settings(settings: &Value) -> Vec<String> {
-    let Some(models) = settings
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+
+    let push_id = |model: &str, seen: &mut HashSet<String>, ids: &mut Vec<String>| {
+        let model = model.trim();
+        if !model.is_empty() && seen.insert(model.to_string()) {
+            ids.push(model.to_string());
+        }
+    };
+
+    if let Some(models) = settings
         .get("modelCatalog")
         .and_then(|catalog| catalog.get("models"))
         .and_then(|models| models.as_array())
-    else {
-        return Vec::new();
-    };
+    {
+        for model_config in models {
+            if let Some(model) = model_config.get("model").and_then(Value::as_str) {
+                push_id(model, &mut seen, &mut ids);
+            }
+        }
+    }
 
-    let mut seen = HashSet::new();
-    models
-        .iter()
-        .filter_map(|model_config| {
-            model_config
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
-        })
-        .filter(|model| seen.insert((*model).to_string()))
-        .map(str::to_string)
-        .collect()
+    if let Some(custom_models) = settings.get("codexCustomModels").and_then(Value::as_array) {
+        for item in custom_models {
+            if let Some(model) = item.get("model").and_then(Value::as_str) {
+                push_id(model, &mut seen, &mut ids);
+            }
+        }
+    }
+
+    ids
 }
 
 /// Decode a Statsig localStorage wrapper value. Chrome's WebView2 stores the
@@ -199,13 +215,14 @@ fn codex_desktop_statsig_has_only_models_config(wrapper: &Value) -> bool {
     let Some(dynamic_configs) = data.get("dynamic_configs").and_then(Value::as_object) else {
         return false;
     };
-    let has_sibling_evaluations = ["feature_gates", "layer_configs"]
-        .iter()
-        .any(|key| match data.get(*key) {
-            None => false,
-            Some(Value::Object(entries)) => !entries.is_empty(),
-            Some(_) => true,
-        });
+    let has_sibling_evaluations =
+        ["feature_gates", "layer_configs"]
+            .iter()
+            .any(|key| match data.get(*key) {
+                None => false,
+                Some(Value::Object(entries)) => !entries.is_empty(),
+                Some(_) => true,
+            });
     !has_sibling_evaluations
         && dynamic_configs.len() == 1
         && dynamic_configs.contains_key(CODEX_DESKTOP_STATSIG_MODELS_CONFIG_ID)
@@ -685,15 +702,6 @@ fn sync_codex_desktop_available_models_cache_path_with_status(
     )
 }
 
-#[cfg(test)]
-fn sync_codex_desktop_available_models_cache_path(
-    leveldb_path: &Path,
-    model_ids: &[String],
-) -> Result<usize, String> {
-    sync_codex_desktop_available_models_cache_path_with_status(leveldb_path, model_ids)
-        .map(|result| result.updated_count)
-}
-
 fn codex_desktop_leveldb_candidate_is_active_layout_for_platform(
     path: &Path,
     root_layouts_active: bool,
@@ -786,22 +794,11 @@ fn sync_codex_desktop_available_models_cache_with_mode(
     )
 }
 
-#[cfg(test)]
-fn sync_codex_desktop_available_models_cache_candidates(
-    candidates: &[PathBuf],
-    model_ids: &[String],
-) -> Result<CodexDesktopCacheSyncResult, String> {
-    sync_codex_desktop_available_models_cache_candidates_with_mode(
-        candidates,
-        model_ids,
-        CodexDesktopCachePinPolicy::Reconcile,
-    )
-}
-
 fn codex_desktop_cache_error_is_locked(err: &str) -> bool {
     err.contains("Codex Desktop localStorage LevelDB is locked:")
 }
 
+#[cfg(not(test))]
 fn attempt_codex_desktop_available_models_cache_retry(
     generation: u64,
     model_ids: &[String],
@@ -822,6 +819,7 @@ fn attempt_codex_desktop_available_models_cache_retry(
     }
 }
 
+#[cfg(not(test))]
 fn codex_desktop_cache_worker_next_delay(
     outcome: &CodexDesktopCacheRetryOutcome,
     has_custom_catalog: bool,
@@ -832,9 +830,12 @@ fn codex_desktop_cache_worker_next_delay(
         CodexDesktopCacheRetryOutcome::Synced(_) if !has_custom_catalog => None,
         CodexDesktopCacheRetryOutcome::Synced(_) => {
             *retry_delay_secs = CODEX_DESKTOP_CACHE_RETRY_INITIAL_DELAY_SECS;
-            Some(Duration::from_secs(CODEX_DESKTOP_CACHE_RENEWAL_INTERVAL_SECS))
+            Some(Duration::from_secs(
+                CODEX_DESKTOP_CACHE_RENEWAL_INTERVAL_SECS,
+            ))
         }
-        CodexDesktopCacheRetryOutcome::Discovering(_) | CodexDesktopCacheRetryOutcome::Failed(_) => {
+        CodexDesktopCacheRetryOutcome::Discovering(_)
+        | CodexDesktopCacheRetryOutcome::Failed(_) => {
             let delay = Duration::from_secs(*retry_delay_secs);
             *retry_delay_secs = retry_delay_secs
                 .saturating_mul(2)
@@ -936,7 +937,8 @@ fn run_codex_desktop_available_models_cache_worker(
                     });
                 }
                 CodexDesktopCacheWorkerUpdate::Cancel { generation }
-                    if CODEX_DESKTOP_CACHE_SYNC_GENERATION.load(Ordering::Acquire) == generation =>
+                    if CODEX_DESKTOP_CACHE_SYNC_GENERATION.load(Ordering::Acquire)
+                        == generation =>
                 {
                     task = None;
                 }
@@ -1043,11 +1045,15 @@ fn sync_codex_desktop_available_models_cache_model_ids_with_policy(
                 log::info!("Synced {updated} Codex Desktop model whitelist cache entries");
             }
             let next_delay = if result.needs_discovery {
-                Some(Duration::from_secs(CODEX_DESKTOP_CACHE_RETRY_INITIAL_DELAY_SECS))
+                Some(Duration::from_secs(
+                    CODEX_DESKTOP_CACHE_RETRY_INITIAL_DELAY_SECS,
+                ))
             } else if model_ids.is_empty() {
                 None
             } else {
-                Some(Duration::from_secs(CODEX_DESKTOP_CACHE_RENEWAL_INTERVAL_SECS))
+                Some(Duration::from_secs(
+                    CODEX_DESKTOP_CACHE_RENEWAL_INTERVAL_SECS,
+                ))
             };
             schedule_codex_desktop_available_models_cache_worker(
                 generation, model_ids, pin_policy, next_delay,
@@ -1061,14 +1067,18 @@ fn sync_codex_desktop_available_models_cache_model_ids_with_policy(
                 generation,
                 model_ids,
                 pin_policy,
-                Some(Duration::from_secs(CODEX_DESKTOP_CACHE_RETRY_INITIAL_DELAY_SECS)),
+                Some(Duration::from_secs(
+                    CODEX_DESKTOP_CACHE_RETRY_INITIAL_DELAY_SECS,
+                )),
             );
         }
         Err(err) => {
             log::warn!(
                 "Codex provider switched, but the Desktop model whitelist cache was not synced: {err}"
             );
-            let next_delay = Some(Duration::from_secs(CODEX_DESKTOP_CACHE_RETRY_INITIAL_DELAY_SECS));
+            let next_delay = Some(Duration::from_secs(
+                CODEX_DESKTOP_CACHE_RETRY_INITIAL_DELAY_SECS,
+            ));
             schedule_codex_desktop_available_models_cache_worker(
                 generation, model_ids, pin_policy, next_delay,
             );
@@ -1203,5 +1213,250 @@ pub(crate) fn sync_codex_desktop_available_models_cache_after_provider_write(
     match codex_desktop_available_models_cache_ids_after_provider_write(settings, config_text) {
         Some(model_ids) => sync_codex_desktop_available_models_cache_model_ids(model_ids),
         None => remove_codex_desktop_owned_models_preserving_cache_pins(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_desktop_statsig_merge_appends_models_without_duplicates() {
+        let data = json!({
+            "dynamic_configs": {
+                CODEX_DESKTOP_STATSIG_MODELS_CONFIG_ID: {
+                    "value": {
+                        "available_models": ["gpt-5.5", "gpt-5.6-sol"]
+                    }
+                }
+            }
+        });
+        let mut wrapper = json!({
+            "source": "NetworkNotModified",
+            "data": data.to_string()
+        });
+        let models = vec![
+            "gpt-5.6-sol".to_string(),
+            "gpt-5.6-terra".to_string(),
+            "gpt-5.6-luna".to_string(),
+        ];
+
+        assert!(merge_codex_desktop_statsig_available_models(
+            &mut wrapper,
+            &models
+        ));
+        assert_eq!(
+            codex_desktop_statsig_available_model_ids(&wrapper),
+            Some(HashSet::from([
+                "gpt-5.5".to_string(),
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "gpt-5.6-luna".to_string(),
+            ]))
+        );
+        assert!(!merge_codex_desktop_statsig_available_models(
+            &mut wrapper,
+            &models
+        ));
+
+        let next_models = vec!["gpt-5.6-sol".to_string(), "gpt-5.6-orbit".to_string()];
+        assert!(merge_codex_desktop_statsig_available_models(
+            &mut wrapper,
+            &next_models
+        ));
+        assert_eq!(
+            codex_desktop_statsig_available_model_ids(&wrapper),
+            Some(HashSet::from([
+                "gpt-5.5".to_string(),
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-orbit".to_string(),
+            ]))
+        );
+
+        assert!(merge_codex_desktop_statsig_available_models(
+            &mut wrapper,
+            &[]
+        ));
+        assert_eq!(
+            codex_desktop_statsig_available_model_ids(&wrapper),
+            Some(HashSet::from([
+                "gpt-5.5".to_string(),
+                "gpt-5.6-sol".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn codex_desktop_statsig_merge_skips_entries_without_models_config() {
+        let data = json!({
+            "dynamic_configs": {
+                "unrelated-config": {
+                    "value": { "enabled": true }
+                }
+            }
+        });
+        let mut wrapper = json!({
+            "source": "NetworkNotModified",
+            "data": data.to_string()
+        });
+        let original = wrapper.clone();
+
+        assert!(!merge_codex_desktop_statsig_available_models(
+            &mut wrapper,
+            &["gpt-5.6-sol".to_string()]
+        ));
+        assert_eq!(wrapper, original);
+    }
+
+    #[test]
+    fn codex_desktop_statsig_pin_rejects_sibling_evaluation_collections() {
+        let data = json!({
+            "dynamic_configs": {
+                CODEX_DESKTOP_STATSIG_MODELS_CONFIG_ID: {
+                    "value": { "available_models": ["gpt-5.5"] }
+                }
+            },
+            "feature_gates": { "unrelated-gate": { "value": true } },
+            "layer_configs": { "unrelated-layer": { "value": { "enabled": true } } }
+        });
+        let wrapper = json!({
+            "source": "Network",
+            "data": data.to_string()
+        });
+
+        assert!(
+            !codex_desktop_statsig_has_only_models_config(&wrapper),
+            "evaluation bundles with sibling collections must not be future-pinned"
+        );
+    }
+
+    #[test]
+    fn codex_desktop_statsig_wrapper_round_trips_utf16le_values() {
+        let wrapper = json!({
+            "source": "NetworkNotModified",
+            "data": "{}"
+        });
+        let text = serde_json::to_string(&wrapper).unwrap();
+        let mut encoded = vec![1];
+        for unit in text.encode_utf16() {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let (prefix, encoding, decoded) = decode_codex_desktop_statsig_wrapper(&encoded).unwrap();
+        assert_eq!(prefix, Some(1));
+        assert_eq!(encoding, CodexDesktopStatsigWrapperEncoding::Utf16Le);
+        assert_eq!(decoded, wrapper);
+        assert_eq!(
+            encode_codex_desktop_statsig_wrapper(prefix, encoding, &decoded).unwrap(),
+            encoded
+        );
+    }
+
+    #[test]
+    fn codex_desktop_statsig_pin_keeps_custom_cache_newer_than_network_refresh() {
+        let mut last_modified = json!({
+            "statsig.cached.evaluations.custom": 1_000,
+            "statsig.cached.evaluations.network": 2_000,
+        });
+        let cache_keys = HashSet::from(["statsig.cached.evaluations.custom".to_string()]);
+
+        assert!(pin_codex_desktop_statsig_last_modified_cache_keys(
+            &mut last_modified,
+            &cache_keys,
+            10_000,
+        ));
+        assert!(
+            last_modified["statsig.cached.evaluations.custom"]
+                .as_i64()
+                .unwrap()
+                > last_modified["statsig.cached.evaluations.network"]
+                    .as_i64()
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_desktop_statsig_leveldb_sync_updates_cached_models() {
+        let temp_dir = tempfile::tempdir().expect("create temp leveldb");
+        let options = rusty_leveldb::Options {
+            create_if_missing: true,
+            ..Default::default()
+        };
+        let mut db = rusty_leveldb::DB::open(temp_dir.path(), options).expect("open temp leveldb");
+        let key = b"_https://codex\x00statsig.cached.evaluations.active".to_vec();
+        let last_modified_key =
+            b"_https://codex\x00statsig.last_modified_time.evaluations".to_vec();
+        let data = json!({
+            "dynamic_configs": {
+                CODEX_DESKTOP_STATSIG_MODELS_CONFIG_ID: {
+                    "value": { "available_models": ["gpt-5.5"] }
+                },
+                "unrelated-feature": { "value": { "enabled": true } }
+            }
+        });
+        let wrapper = json!({ "source": "Network", "data": data.to_string() });
+        let value = encode_codex_desktop_statsig_wrapper(
+            Some(1),
+            CodexDesktopStatsigWrapperEncoding::Utf8,
+            &wrapper,
+        )
+        .unwrap();
+        db.put(&key, &value).expect("seed cache");
+        let last_modified_value = encode_codex_desktop_statsig_wrapper(
+            Some(1),
+            CodexDesktopStatsigWrapperEncoding::Utf8,
+            &json!({ "statsig.cached.evaluations.active": 1_000 }),
+        )
+        .unwrap();
+        db.put(&last_modified_key, &last_modified_value)
+            .expect("seed last modified cache");
+        db.close().expect("close seeded leveldb");
+
+        let result = sync_codex_desktop_available_models_cache_path_with_status(
+            temp_dir.path(),
+            &["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()],
+        )
+        .expect("sync temp leveldb");
+        assert_eq!(result.updated_count, 1);
+        assert!(
+            !result.ready_model_cache,
+            "a shared dynamic-config bundle must not be treated as safely pinned"
+        );
+        assert!(
+            result.requires_short_retry,
+            "a shared dynamic-config bundle needs short maintenance retries"
+        );
+
+        let options = rusty_leveldb::Options {
+            create_if_missing: false,
+            ..Default::default()
+        };
+        let mut db = rusty_leveldb::DB::open(temp_dir.path(), options).expect("reopen leveldb");
+        let value = db.get(&key).expect("read updated cache");
+        let (_, _, wrapper) = decode_codex_desktop_statsig_wrapper(&value).unwrap();
+        assert_eq!(
+            codex_desktop_statsig_available_model_ids(&wrapper),
+            Some(HashSet::from([
+                "gpt-5.5".to_string(),
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-terra".to_string(),
+            ]))
+        );
+        let data = serde_json::from_str::<Value>(wrapper["data"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            data["dynamic_configs"]["unrelated-feature"]["value"]["enabled"],
+            true
+        );
+
+        let last_modified_value = db
+            .get(&last_modified_key)
+            .expect("read updated last modified cache");
+        let (_, _, last_modified) =
+            decode_codex_desktop_statsig_wrapper(&last_modified_value).unwrap();
+        assert_eq!(
+            last_modified["statsig.cached.evaluations.active"].as_i64(),
+            Some(1_000)
+        );
+        db.close().expect("close leveldb");
     }
 }

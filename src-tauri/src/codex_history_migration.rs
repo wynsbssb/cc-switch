@@ -233,8 +233,12 @@ pub fn maybe_migrate_codex_official_history_to_unified_bucket(
         });
     }
 
-    let source_provider_ids: BTreeSet<String> =
-        std::iter::once(OFFICIAL_OPENAI_CODEX_MODEL_PROVIDER_ID.to_string()).collect();
+    let source_provider_ids: BTreeSet<String> = [
+        OFFICIAL_OPENAI_CODEX_MODEL_PROVIDER_ID.to_string(),
+        crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID.to_string(),
+    ]
+    .into_iter()
+    .collect();
     let backup_root = migration_backup_root(OFFICIAL_UNIFY_MIGRATION_NAME);
     let migrated_jsonl_files =
         migrate_codex_jsonl_files(&codex_dir, &source_provider_ids, &backup_root)?;

@@ -5,9 +5,11 @@ mod claude_desktop_config;
 mod claude_mcp;
 mod claude_plugin;
 mod codex_config;
+mod codex_desktop_conversations;
 mod codex_desktop_statsig;
 mod codex_history_migration;
 mod codex_state_db;
+mod codex_unified_storage;
 mod commands;
 mod config;
 mod database;
@@ -792,6 +794,69 @@ pub fn run() {
                     }
                 });
             }
+            {
+                // Sync the current Codex provider's catalog model ids into the
+                // Codex Desktop Statsig available_models whitelist so configured
+                // models show in the Desktop model picker instead of the raw id
+                // as "Custom".
+                let db_for_desktop_cache = app_state.db.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let provider_id = crate::settings::get_effective_current_provider(
+                        &db_for_desktop_cache,
+                        &crate::app_config::AppType::Codex,
+                    )
+                    .ok()
+                    .flatten();
+                    let Some(provider_id) = provider_id else {
+                        return;
+                    };
+                    let Ok(Some(provider)) =
+                        db_for_desktop_cache.get_provider_by_id(&provider_id, "codex")
+                    else {
+                        return;
+                    };
+                    crate::codex_desktop_statsig::sync_codex_desktop_available_models_cache_from_settings(
+                        &provider.settings_config,
+                    );
+                });
+            }
+            {
+                // 启动时快照一次 Codex 桌面端对话数据（~/.codex sessions /
+                // state DB 等），保证用户之后即使关闭 cc-switch、直接在桌面端
+                // 用 ChatGPT 账号登录导致本地会话被清/被隐藏，数据也能从
+                // ~/.cc-switch/backups/codex-desktop-conversations/ 一键恢复。
+                // 函数内部自门控：开关关闭、没有会话数据、或数据自上次快照
+                // 以来未变化时直接跳过，避免每次启动都重复复制数百 MB。
+                tauri::async_runtime::spawn_blocking(move || {
+                    match crate::codex_desktop_conversations::
+                        snapshot_codex_desktop_conversations_if_changed()
+                    {
+                        Ok(outcome) => {
+                            if let Some(reason) = outcome.skipped_reason {
+                                log::debug!("Codex desktop conversation snapshot skipped: {reason}");
+                            } else {
+                                log::info!(
+                                    "Codex desktop conversation snapshot on startup: jsonl={}, archived={}, state_dbs={}",
+                                    outcome.jsonl_files,
+                                    outcome.archived_files,
+                                    outcome.state_dbs
+                                );
+                            }
+                        }
+                        Err(e) => log::warn!("Codex desktop conversation snapshot on startup failed: {e}"),
+                    }
+                });
+            }
+            {
+                // 统一会话存储自愈：开关开着但目录链接丢失（误删 / 杀软清理）
+                // 时自动重建，并把残留的 ~/.codex 会话目录迁入统一目录。
+                tauri::async_runtime::spawn_blocking(|| {
+                    if let Err(e) = crate::codex_unified_storage::ensure_active_on_startup() {
+                        log::warn!("Codex unified session storage ensure failed: {e}");
+                    }
+                });
+            }
+
 
             // 老用户 / 已确认的路径由 `fresh_install_at_startup` 自行拦截，这里不做写入。
             // 字段只由前端在用户点击"我知道了"时 save_settings 回写，语义是"用户显式确认过"。
@@ -1354,6 +1419,12 @@ pub fn run() {
             commands::save_settings,
             commands::has_codex_unify_history_backup,
             commands::restore_codex_unified_history,
+            commands::has_codex_desktop_conversations_backup,
+            commands::snapshot_codex_desktop_conversations,
+            commands::restore_codex_desktop_conversations,
+            commands::enable_codex_unified_storage,
+            commands::disable_codex_unified_storage,
+            commands::get_codex_unified_storage_status,
             commands::get_rectifier_config,
             commands::set_rectifier_config,
             commands::get_optimizer_config,
@@ -1818,6 +1889,18 @@ pub fn run() {
 /// 确保 Claude Code/Codex/Gemini 的配置不会处于损坏状态。
 /// 使用 stop_with_restore_keep_state 保留 settings 表中的代理状态，下次启动时自动恢复。
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
+    // 退出前再快照一次 Codex 桌面端对话数据：这是 cc-switch 关闭前最后一次
+    // 保证，用户之后直接用 ChatGPT 账号登录也不丢对话数据。
+    if let Err(e) = tauri::async_runtime::spawn_blocking(|| {
+        crate::codex_desktop_conversations::snapshot_codex_desktop_conversations_if_changed()
+    })
+    .await
+    {
+        log::warn!("Codex desktop conversation snapshot on exit failed: {e}");
+    } else {
+        log::info!("Codex desktop conversation snapshot on exit completed");
+    }
+
     if let Some(state) = app_handle.try_state::<store::AppState>() {
         let proxy_service = &state.proxy_service;
 

@@ -396,6 +396,12 @@ export interface Settings {
   unifyCodexSessionHistory?: boolean;
   // User opted in (enable dialog checkbox) to migrate existing official sessions
   unifyCodexMigrateExisting?: boolean;
+  // Automatically snapshot Codex Desktop conversation data so switching to the
+  // ChatGPT official login never permanently loses local conversations
+  backupCodexDesktopConversations?: boolean;
+  // Physically unify Codex conversation/state data under ~/.cc-switch/codex
+  // (directory links + injected sqlite_home); switches only rewrite config/auth
+  unifyCodexSessionStorage?: boolean;
   // User has confirmed the failover toggle first-run notice
   failoverConfirmed?: boolean;
   // User has confirmed the first-run welcome notice

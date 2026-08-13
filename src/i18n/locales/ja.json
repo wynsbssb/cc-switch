@@ -310,6 +310,21 @@
       "restoreBackup": "オンにした際に移行した公式セッションを公式履歴へ復元する（バックアップから正確に復元）",
       "confirm": "オフにする"
     },
+    "unifyCodexStorage": {
+      "title": "セッションデータの一元保存を有効化",
+      "message": "Codex のセッション・状態データを ~/.cc-switch/codex に一元化します（sessions フォルダは ~/.codex からディレクトリリンクで透過的に参照され、状態 DB は config の sqlite_home でリダイレクトされます）。以降、プロバイダ/ルートの切り替えでは config と auth だけが書き換わり、セッションデータのコピーは発生しないため切り替えが高速になります。\n\n既存の ~/.codex の sessions・archived_sessions・state_5.sqlite は一元ディレクトリへ移動されます。可能であれば先に ChatGPT/Codex デスクトップを終了してください。",
+      "confirm": "移行して有効化"
+    },
+    "unifyCodexStorageOff": {
+      "title": "セッションデータの一元保存を無効化",
+      "message": "無効化すると、一元ディレクトリのセッション・状態データは ~/.codex へ戻され、ディレクトリリンクは削除されます。ChatGPT/Codex デスクトップが実行中だとロックされたファイルの移動に失敗する場合があります。先にデスクトップを終了してください。",
+      "confirm": "戻して無効化"
+    },
+    "restoreCodexDesktopConversations": {
+      "title": "デスクトップの会話データを復元",
+      "message": "最新の自動バックアップで現在のローカル会話（セッションファイル・セッション索引・状態 DB）を上書きします。現在のデータは先に ~/.cc-switch/backups の pre-restore フォルダへ退避されるため、操作は元に戻せます。\n\n状態 DB がロックされないよう、先に ChatGPT デスクトップを終了することをお勧めします。",
+      "confirm": "復元"
+    },
     "usage": {
       "title": "使用量クエリの設定",
       "message": "使用量クエリにはカスタムスクリプトまたは API パラメータが必要です。プロバイダーから必要な情報を取得していることをご確認ください。\n\n設定方法が不明な場合は、プロバイダーのドキュメントを先にご確認ください。",
@@ -700,6 +715,22 @@
     "unifyCodexHistoryRestoreFailed": "公式セッション履歴の復元に失敗しました。もう一度お試しください",
     "unifyCodexHistoryRestoreNothing": "現在の Codex ディレクトリに復元可能な移行バックアップはありません",
     "unifyCodexHistoryRestoreSkippedToggleOn": "統一セッション履歴が再度有効化されたため、復元をスキップしました",
+    "backupCodexDesktopConversations": "デスクトップの会話データを自動バックアップ",
+    "backupCodexDesktopConversationsDescription": "cc-switch の稼働中（起動時・Codex プロバイダー切替時・終了時・手動）に、デスクトップのローカル会話（~/.codex の sessions・セッション索引・状態 DB）を ~/.cc-switch/backups/codex-desktop-conversations/ へスナップショットします。cc-switch を閉じた後にデスクトップアプリで ChatGPT アカウントに直接ログインしてローカル会話が消えても、ワンクリックで復元でき、データは失われません。",
+    "backupCodexDesktopConversationsNow": "今すぐバックアップ",
+    "backupCodexDesktopConversationsCompleted": "デスクトップの会話データをバックアップしました（{{files}} 件のセッションファイル、{{dbs}} 件の状態 DB）",
+    "backupCodexDesktopConversationsFailed": "デスクトップの会話データのバックアップに失敗しました",
+    "backupCodexDesktopConversationsSkipped": "バックアップ対象の会話データがありません（スイッチがオフ、またはセッションがありません）",
+    "restoreCodexDesktopConversations": "バックアップから復元",
+    "restoreCodexDesktopConversationsCompleted": "バックアップからデスクトップの会話データを復元しました（{{files}} 件のセッションファイル、{{dbs}} 件の状態 DB）",
+    "restoreCodexDesktopConversationsFailed": "デスクトップの会話データの復元に失敗しました",
+    "restoreCodexDesktopConversationsNothing": "現在の Codex ディレクトリに復元可能なバックアップがありません",
+    "unifyCodexStorage": "セッションデータの一元保存",
+    "unifyCodexStorageDescription": "Codex のセッション・状態データを ~/.cc-switch/codex に一元化します（ディレクトリリンク + sqlite_home）。ルート切り替えでは設定のみ書き換え、セッションのコピーは発生しないため高速化し、データも切り替えの影響を受けません。",
+    "unifyCodexStorageEnabled": "セッションデータの一元保存を有効化しました。ルート切り替えでセッションをコピーしません",
+    "unifyCodexStorageEnableFailed": "セッションデータの一元保存の有効化に失敗しました",
+    "unifyCodexStorageDisabled": "セッションデータの一元保存を無効化し、データを ~/.codex へ戻しました",
+    "unifyCodexStorageDisableFailed": "セッションデータの一元保存の無効化に失敗しました。ChatGPT/Codex デスクトップを終了して再試行してください",
     "appVisibility": {
       "title": "ホームページ表示",
       "description": "ホームページに表示するアプリを選択",
@@ -793,7 +824,7 @@
     "checking": "確認中...",
     "upToDate": "最新バージョンです",
     "aboutHint": "バージョン情報と更新状況を表示します。",
-    "authorCredit": "???tycykp",
+    "authorCredit": "by tycykp",
     "portableMode": "ポータブルモード: 更新は手動ダウンロードが必要です。",
     "updateAvailable": "新しいバージョンがあります: {{version}}",
     "updateBadge": "更新あり",

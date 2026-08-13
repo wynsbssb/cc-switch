@@ -21,14 +21,25 @@ export function fmtInt(
   return new Intl.NumberFormat(locale).format(Math.trunc(num));
 }
 
-export function fmtUsd(
+/** 美元兑人民币汇率：把内部以 USD 计价的 token 成本自动换算成 RMB 展示。如需调整汇率，只改这里即可。 */
+export const USD_TO_CNY_RATE = 7.14;
+
+/** 把 USD 金额换算为 RMB 金额。 */
+export function usdToCny(usd: number): number {
+  return usd * USD_TO_CNY_RATE;
+}
+
+/**
+ * 格式化 token 成本：入参是 USD 金额，自动按 USD_TO_CNY_RATE 换算并以 ¥（RMB）展示。
+ */
+export function fmtCny(
   value: unknown,
   digits: number,
   fallback: string = "--",
 ): string {
   const num = parseFiniteNumber(value);
   if (num == null) return fallback;
-  return `$${num.toFixed(digits)}`;
+  return `¥${usdToCny(num).toFixed(digits)}`;
 }
 
 function normalizeLanguageTag(language: string): string {

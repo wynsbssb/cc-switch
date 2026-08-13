@@ -1,11 +1,19 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { History, KeyRound } from "lucide-react";
+import {
+  History,
+  KeyRound,
+  HardDriveDownload,
+  RotateCcw,
+  Loader2,
+  FolderTree,
+} from "lucide-react";
 import { toast } from "sonner";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import { ToggleRow } from "@/components/ui/toggle-row";
+import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { settingsApi } from "@/lib/api";
+import { settingsApi, type CodexUnifiedStorageResult } from "@/lib/api";
 
 interface CodexAuthSettingsProps {
   settings: SettingsFormState;
@@ -23,6 +31,23 @@ export function CodexAuthSettings({
   const [showEnableConfirm, setShowEnableConfirm] = useState(false);
   const [showDisableConfirm, setShowDisableConfirm] = useState(false);
   const [hasUnifyBackup, setHasUnifyBackup] = useState(false);
+  const [showRestoreConfirm, setShowRestoreConfirm] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [unifiedBusy, setUnifiedBusy] = useState(false);
+  const [unifiedStatus, setUnifiedStatus] =
+    useState<CodexUnifiedStorageResult | null>(null);
+  const [showUnifiedEnableConfirm, setShowUnifiedEnableConfirm] =
+    useState(false);
+  const [showUnifiedDisableConfirm, setShowUnifiedDisableConfirm] =
+    useState(false);
+
+  useEffect(() => {
+    void settingsApi
+      .getCodexUnifiedStorageStatus()
+      .then(setUnifiedStatus)
+      .catch(() => undefined);
+  }, []);
 
   const handleUnifyHistoryChange = (checked: boolean) => {
     if (checked) {
@@ -88,6 +113,92 @@ export function CodexAuthSettings({
     }
   };
 
+  const handleSnapshotNow = async () => {
+    setBackupBusy(true);
+    try {
+      const result = await settingsApi.snapshotCodexDesktopConversations();
+      if (result.skippedReason) {
+        toast.info(t("settings.backupCodexDesktopConversationsSkipped"));
+        return;
+      }
+      toast.success(
+        t("settings.backupCodexDesktopConversationsCompleted", {
+          files: result.jsonlFiles + result.archivedFiles,
+          dbs: result.stateDbs,
+        }),
+      );
+    } catch (error) {
+      console.error("Failed to snapshot codex desktop conversations:", error);
+      toast.error(t("settings.backupCodexDesktopConversationsFailed"));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const handleRestoreConfirm = async () => {
+    setShowRestoreConfirm(false);
+    setRestoreBusy(true);
+    try {
+      const result = await settingsApi.restoreCodexDesktopConversations();
+      if (result.skippedReason) {
+        toast.info(t("settings.restoreCodexDesktopConversationsNothing"));
+        return;
+      }
+      toast.success(
+        t("settings.restoreCodexDesktopConversationsCompleted", {
+          files: result.jsonlFiles + result.archivedFiles,
+          dbs: result.stateDbs,
+        }),
+      );
+    } catch (error) {
+      console.error("Failed to restore codex desktop conversations:", error);
+      toast.error(t("settings.restoreCodexDesktopConversationsFailed"));
+    } finally {
+      setRestoreBusy(false);
+    }
+  };
+
+  const handleUnifiedStorageChange = (checked: boolean) => {
+    if (unifiedBusy) return;
+    if (checked) {
+      setShowUnifiedEnableConfirm(true);
+      return;
+    }
+    setShowUnifiedDisableConfirm(true);
+  };
+
+  const handleUnifiedEnable = async () => {
+    setShowUnifiedEnableConfirm(false);
+    setUnifiedBusy(true);
+    try {
+      const result = await settingsApi.enableCodexUnifiedStorage();
+      setUnifiedStatus(result);
+      await onChange({ unifyCodexSessionStorage: true });
+      toast.success(t("settings.unifyCodexStorageEnabled"));
+    } catch (error) {
+      console.error("Failed to enable codex unified storage:", error);
+      toast.error(t("settings.unifyCodexStorageEnableFailed"));
+    } finally {
+      setUnifiedBusy(false);
+    }
+  };
+
+  const handleUnifiedDisable = async () => {
+    setShowUnifiedDisableConfirm(false);
+    setUnifiedBusy(true);
+    try {
+      const result = await settingsApi.disableCodexUnifiedStorage();
+      setUnifiedStatus(result);
+      await onChange({ unifyCodexSessionStorage: false });
+      toast.success(t("settings.unifyCodexStorageDisabled"));
+    } catch (error) {
+      console.error("Failed to disable codex unified storage:", error);
+      toast.error(t("settings.unifyCodexStorageDisableFailed"));
+    } finally {
+      setUnifiedBusy(false);
+    }
+  };
+
   return (
     <section className="space-y-4">
       <div className="flex items-center gap-2 pb-2 border-b border-border/40">
@@ -113,6 +224,64 @@ export function CodexAuthSettings({
         onCheckedChange={handleUnifyHistoryChange}
       />
 
+      <ToggleRow
+        icon={<HardDriveDownload className="h-4 w-4 text-amber-500" />}
+        title={t("settings.backupCodexDesktopConversations")}
+        description={t("settings.backupCodexDesktopConversationsDescription")}
+        checked={settings.backupCodexDesktopConversations ?? true}
+        onCheckedChange={(value) =>
+          onChange({ backupCodexDesktopConversations: value })
+        }
+      />
+
+      <ToggleRow
+        icon={<FolderTree className="h-4 w-4 text-violet-500" />}
+        title={t("settings.unifyCodexStorage")}
+        description={t("settings.unifyCodexStorageDescription")}
+        checked={settings.unifyCodexSessionStorage ?? false}
+        disabled={unifiedBusy}
+        onCheckedChange={handleUnifiedStorageChange}
+      />
+      {unifiedStatus?.active ? (
+        <div className="space-y-1 pl-1">
+          <p className="font-mono text-xs text-muted-foreground">
+            {unifiedStatus.sessionsDir}
+          </p>
+          <p className="font-mono text-xs text-muted-foreground">
+            {unifiedStatus.stateDir}
+          </p>
+        </div>
+      ) : null}
+
+      <div className="flex flex-wrap items-center gap-2 pl-1">
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={backupBusy || restoreBusy}
+          onClick={() => void handleSnapshotNow()}
+        >
+          {backupBusy ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <HardDriveDownload className="h-4 w-4" />
+          )}
+          {t("settings.backupCodexDesktopConversationsNow")}
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={backupBusy || restoreBusy}
+          onClick={() => setShowRestoreConfirm(true)}
+        >
+          {restoreBusy ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <RotateCcw className="h-4 w-4" />
+          )}
+          {t("settings.restoreCodexDesktopConversations")}
+        </Button>
+      </div>
+
       <ConfirmDialog
         isOpen={showEnableConfirm}
         title={t("confirm.unifyCodexHistory.title")}
@@ -136,6 +305,33 @@ export function CodexAuthSettings({
         confirmText={t("confirm.unifyCodexHistoryOff.confirm")}
         onConfirm={(restoreBackup) => void handleDisableConfirm(restoreBackup)}
         onCancel={() => setShowDisableConfirm(false)}
+      />
+
+      <ConfirmDialog
+        isOpen={showRestoreConfirm}
+        title={t("confirm.restoreCodexDesktopConversations.title")}
+        message={t("confirm.restoreCodexDesktopConversations.message")}
+        confirmText={t("confirm.restoreCodexDesktopConversations.confirm")}
+        onConfirm={() => void handleRestoreConfirm()}
+        onCancel={() => setShowRestoreConfirm(false)}
+      />
+
+      <ConfirmDialog
+        isOpen={showUnifiedEnableConfirm}
+        title={t("confirm.unifyCodexStorage.title")}
+        message={t("confirm.unifyCodexStorage.message")}
+        confirmText={t("confirm.unifyCodexStorage.confirm")}
+        onConfirm={() => void handleUnifiedEnable()}
+        onCancel={() => setShowUnifiedEnableConfirm(false)}
+      />
+
+      <ConfirmDialog
+        isOpen={showUnifiedDisableConfirm}
+        title={t("confirm.unifyCodexStorageOff.title")}
+        message={t("confirm.unifyCodexStorageOff.message")}
+        confirmText={t("confirm.unifyCodexStorageOff.confirm")}
+        onConfirm={() => void handleUnifiedDisable()}
+        onCancel={() => setShowUnifiedDisableConfirm(false)}
       />
     </section>
   );

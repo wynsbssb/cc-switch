@@ -391,6 +391,16 @@ pub struct AppSettings {
     /// a failed migration retries at startup; cleared when the toggle turns off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unify_codex_migrate_existing: Option<bool>,
+    /// Automatically snapshot the Codex Desktop conversation data
+    /// (~/.codex sessions / state DB) so switching to the ChatGPT official
+    /// login never permanently loses local conversations. Defaults to on.
+    #[serde(default = "default_true")]
+    pub backup_codex_desktop_conversations: bool,
+    /// Physically unify Codex conversation/state data under
+    /// ~/.cc-switch/codex (directory links + injected sqlite_home) so provider
+    /// switches only rewrite config/auth and never touch session data. Opt-in.
+    #[serde(default)]
+    pub unify_codex_session_storage: bool,
     /// User has confirmed the failover toggle first-run notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failover_confirmed: Option<bool>,
@@ -521,6 +531,8 @@ impl Default for AppSettings {
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,
             unify_codex_migrate_existing: None,
+            backup_codex_desktop_conversations: true,
+            unify_codex_session_storage: false,
             failover_confirmed: None,
             first_run_notice_confirmed: None,
             common_config_confirmed: None,
@@ -951,6 +963,33 @@ pub fn unify_codex_session_history() -> bool {
             e.into_inner()
         })
         .unify_codex_session_history
+}
+
+pub fn backup_codex_desktop_conversations() -> bool {
+    settings_store()
+        .read()
+        .unwrap_or_else(|e| {
+            log::warn!("设置锁已毒化，使用恢复值: {e}");
+            e.into_inner()
+        })
+        .backup_codex_desktop_conversations
+}
+
+/// 是否启用 Codex 会话/状态数据统一存放（~/.cc-switch/codex）。
+pub fn unify_codex_session_storage() -> bool {
+    settings_store()
+        .read()
+        .unwrap_or_else(|e| {
+            log::warn!("设置锁已毒化，使用恢复值: {e}");
+            e.into_inner()
+        })
+        .unify_codex_session_storage
+}
+
+pub fn set_unify_codex_session_storage(value: bool) -> Result<(), AppError> {
+    let mut settings = get_settings();
+    settings.unify_codex_session_storage = value;
+    update_settings(settings)
 }
 
 // ===== 当前供应商管理函数 =====
