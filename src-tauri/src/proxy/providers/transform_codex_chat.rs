@@ -9,6 +9,7 @@ use super::codex_chat_common::{
     response_function_call_item, response_function_call_item_with_namespace,
     split_leading_think_block,
 };
+use super::codex_remote_compaction;
 use crate::provider::CodexChatReasoningConfig;
 use crate::proxy::{
     error::ProxyError,
@@ -267,6 +268,7 @@ pub fn responses_to_chat_completions_with_reasoning(
 ) -> Result<Value, ProxyError> {
     let mut result = json!({});
     let tool_context = build_codex_tool_context_from_request(&body);
+    let is_remote_compaction = codex_remote_compaction::is_remote_compaction_request(&body);
 
     if let Some(model) = body.get("model") {
         result["model"] = model.clone();
@@ -334,8 +336,9 @@ pub fn responses_to_chat_completions_with_reasoning(
     let has_tools = result
         .get("tools")
         .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()));
-    if !has_tools {
+    if !has_tools || is_remote_compaction {
         if let Some(obj) = result.as_object_mut() {
+            obj.remove("tools");
             obj.remove("tool_choice");
             obj.remove("parallel_tool_calls");
         }
@@ -622,6 +625,29 @@ fn append_responses_item_as_chat_message(
 ) -> Result<(), ProxyError> {
     let item_type = item.get("type").and_then(|v| v.as_str());
     match item_type {
+        Some("compaction_trigger" | "compaction") => {
+            flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                pending_media,
+                pending_reasoning,
+                last_assistant_index,
+            );
+            flush_pending_chat_tool_media(messages, pending_media);
+            attach_pending_reasoning_to_previous_assistant(
+                messages,
+                *last_assistant_index,
+                pending_reasoning,
+            );
+            let content = if item_type == Some("compaction_trigger") {
+                Some(codex_remote_compaction::compaction_prompt().to_string())
+            } else {
+                codex_remote_compaction::restored_compaction_context(item)
+            };
+            if let Some(content) = content {
+                messages.push(json!({ "role": "user", "content": content }));
+            }
+        }
         Some("function_call") => {
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
             pending_tool_calls.push(responses_function_call_to_chat_tool_call(

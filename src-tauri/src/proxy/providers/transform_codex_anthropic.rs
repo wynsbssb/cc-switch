@@ -10,6 +10,7 @@
 //! - `transform_responses.rs`: Anthropic request → Responses request, Responses response → Anthropic response
 //! - this module:               Responses request → Anthropic request, Anthropic response → Responses response
 
+use super::codex_remote_compaction;
 use super::transform_codex_chat::{
     build_codex_tool_context_from_request, response_tool_call_item_from_chat_name,
     response_tool_call_item_id_from_chat_name, CodexToolContext,
@@ -229,6 +230,7 @@ pub fn responses_request_to_anthropic(
 ) -> Result<Value, ProxyError> {
     let mut result = json!({});
     let tool_context = build_codex_tool_context_from_request(&body);
+    let is_remote_compaction = codex_remote_compaction::is_remote_compaction_request(&body);
     let model = body
         .get("model")
         .and_then(|value| value.as_str())
@@ -379,11 +381,15 @@ pub fn responses_request_to_anthropic(
 
     // Reuse the Codex tool context so function, namespace, custom, tool_search, and
     // dynamically loaded tools all receive stable flat names upstream.
-    let anth_tools: Vec<Value> = tool_context
-        .chat_tools()
-        .iter()
-        .filter_map(chat_tool_to_anthropic_tool)
-        .collect();
+    let anth_tools: Vec<Value> = if is_remote_compaction {
+        Vec::new()
+    } else {
+        tool_context
+            .chat_tools()
+            .iter()
+            .filter_map(chat_tool_to_anthropic_tool)
+            .collect()
+    };
     let has_tools = !anth_tools.is_empty();
     if has_tools {
         result["tools"] = json!(anth_tools);
@@ -527,6 +533,22 @@ fn convert_input_to_messages(
         }
 
         match item_type {
+            Some("compaction_trigger") => {
+                push_block(
+                    &mut messages,
+                    "user",
+                    json!({ "type": "text", "text": codex_remote_compaction::compaction_prompt() }),
+                );
+            }
+            Some("compaction") => {
+                if let Some(context) = codex_remote_compaction::restored_compaction_context(item) {
+                    push_block(
+                        &mut messages,
+                        "user",
+                        json!({ "type": "text", "text": context }),
+                    );
+                }
+            }
             Some("function_call") => {
                 let call_id = item
                     .get("call_id")

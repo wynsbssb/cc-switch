@@ -19,7 +19,7 @@ use super::{
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream,
-        get_adapter, get_claude_api_format,
+        codex_remote_compaction, get_adapter, get_claude_api_format,
         streaming::create_anthropic_sse_stream,
         streaming_codex_anthropic::{
             create_responses_sse_stream_from_anthropic_with_context,
@@ -1110,6 +1110,7 @@ async fn handle_responses_for_app(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let is_remote_compaction = codex_remote_compaction::is_remote_compaction_request(&body);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
     // Captured before `body` is moved into the forwarder: the flat-name →
     // {namespace, name} map used to restore the native Responses upstream's
@@ -1150,6 +1151,7 @@ async fn handle_responses_for_app(
             &ctx,
             &state,
             is_stream,
+            is_remote_compaction,
             connection_guard,
             codex_tool_context,
         )
@@ -1162,6 +1164,7 @@ async fn handle_responses_for_app(
             &ctx,
             &state,
             is_stream,
+            is_remote_compaction,
             connection_guard,
             codex_tool_context,
         )
@@ -1247,6 +1250,7 @@ async fn handle_responses_compact_for_app(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let is_remote_compaction = codex_remote_compaction::is_remote_compaction_request(&body);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
     let namespace_restore_map = transform_codex_responses_namespace::namespace_restore_map(&body);
 
@@ -1284,6 +1288,7 @@ async fn handle_responses_compact_for_app(
             &ctx,
             &state,
             is_stream,
+            is_remote_compaction,
             connection_guard,
             codex_tool_context,
         )
@@ -1296,6 +1301,7 @@ async fn handle_responses_compact_for_app(
             &ctx,
             &state,
             is_stream,
+            is_remote_compaction,
             connection_guard,
             codex_tool_context,
         )
@@ -1478,6 +1484,7 @@ async fn handle_codex_chat_to_responses_transform(
     ctx: &RequestContext,
     state: &ProxyState,
     is_stream: bool,
+    is_remote_compaction: bool,
     connection_guard: Option<ActiveConnectionGuard>,
     tool_context: transform_codex_chat::CodexToolContext,
 ) -> Result<axum::response::Response, ProxyError> {
@@ -1490,7 +1497,7 @@ async fn handle_codex_chat_to_responses_transform(
         return handle_codex_chat_error_response(response, ctx, status).await;
     }
 
-    if is_stream || response.is_sse() {
+    if !is_remote_compaction && (is_stream || response.is_sse()) {
         let stream = response.bytes_stream();
         let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
@@ -1581,7 +1588,6 @@ async fn handle_codex_chat_to_responses_transform(
         return Ok((headers, body).into_response());
     }
 
-    let _connection_guard = connection_guard;
     let body_timeout =
         if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
             std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
@@ -1619,7 +1625,7 @@ async fn handle_codex_chat_to_responses_transform(
             ));
         }
     };
-    let responses_response = transform_codex_chat::chat_completion_to_response_with_context(
+    let mut responses_response = transform_codex_chat::chat_completion_to_response_with_context(
         chat_response,
         &tool_context,
     )
@@ -1627,6 +1633,22 @@ async fn handle_codex_chat_to_responses_transform(
         log::error!("[Codex] Chat → Responses 响应转换失败: {e}");
         e
     })?;
+    if is_remote_compaction {
+        responses_response =
+            codex_remote_compaction::convert_response_to_compaction(responses_response);
+        if is_stream {
+            let events = codex_remote_compaction::compaction_sse_events(&responses_response);
+            let stream = futures::stream::iter(events.into_iter().map(Ok::<Bytes, std::io::Error>));
+            return build_codex_anthropic_sse_response(
+                stream,
+                ctx,
+                state,
+                status,
+                connection_guard,
+            );
+        }
+    }
+    let _connection_guard = connection_guard;
     state
         .codex_chat_history
         .record_response(&responses_response)
@@ -1717,6 +1739,7 @@ async fn handle_codex_anthropic_to_responses_transform(
     ctx: &RequestContext,
     state: &ProxyState,
     is_stream: bool,
+    is_remote_compaction: bool,
     connection_guard: Option<ActiveConnectionGuard>,
     codex_tool_context: transform_codex_chat::CodexToolContext,
 ) -> Result<axum::response::Response, ProxyError> {
@@ -1729,7 +1752,7 @@ async fn handle_codex_anthropic_to_responses_transform(
     // Preserve live streaming when the gateway marks SSE correctly or omits an
     // explicit JSON media type. Explicit JSON is buffered below so 2xx error
     // envelopes and gateways that ignore stream:true can be converted faithfully.
-    if response.is_sse() || (is_stream && !response.is_json()) {
+    if !is_remote_compaction && (response.is_sse() || (is_stream && !response.is_json())) {
         let stream = response.bytes_stream();
         let sse_stream =
             create_responses_sse_stream_from_anthropic_with_context(stream, codex_tool_context);
@@ -1777,7 +1800,7 @@ async fn handle_codex_anthropic_to_responses_transform(
         }
     };
 
-    if is_stream {
+    if is_stream && !is_remote_compaction {
         let events =
             responses_sse_events_from_anthropic_message(&anthropic_response, codex_tool_context);
         let sse_stream = futures::stream::iter(events.into_iter().map(Ok::<Bytes, std::io::Error>));
@@ -1790,8 +1813,7 @@ async fn handle_codex_anthropic_to_responses_transform(
         );
     }
 
-    let _connection_guard = connection_guard;
-    let responses_response =
+    let mut responses_response =
         transform_codex_anthropic::anthropic_response_to_responses_with_context(
             anthropic_response,
             &codex_tool_context,
@@ -1800,6 +1822,22 @@ async fn handle_codex_anthropic_to_responses_transform(
             log::error!("[Codex] Failed to convert Anthropic response to Responses: {e}");
             e
         })?;
+    if is_remote_compaction {
+        responses_response =
+            codex_remote_compaction::convert_response_to_compaction(responses_response);
+        if is_stream {
+            let events = codex_remote_compaction::compaction_sse_events(&responses_response);
+            let stream = futures::stream::iter(events.into_iter().map(Ok::<Bytes, std::io::Error>));
+            return build_codex_anthropic_sse_response(
+                stream,
+                ctx,
+                state,
+                status,
+                connection_guard,
+            );
+        }
+    }
+    let _connection_guard = connection_guard;
 
     if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_response)
         .filter(TokenUsage::has_billable_tokens)
